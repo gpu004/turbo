@@ -3,15 +3,23 @@ import { describe, expect, it } from "vitest";
 
 describe("queue Worker", () => {
   it("pushes, deduplicates, claims, heartbeats, and completes a job", async () => {
-    const firstPush = await post("/queues/integration/jobs", {
-      payload: { namespace: "42", walSequence: 1 },
-    }, { "idempotency-key": "wal-1" });
+    const firstPush = await post(
+      "/queues/integration/jobs",
+      {
+        payload: { namespace: "42", walSequence: 1 },
+      },
+      { "idempotency-key": "wal-1" },
+    );
     expect(firstPush.status).toBe(201);
     const first = await firstPush.json<PushResponse>();
 
-    const duplicatePush = await post("/queues/integration/jobs", {
-      payload: { namespace: "42", walSequence: 1 },
-    }, { "idempotency-key": "wal-1" });
+    const duplicatePush = await post(
+      "/queues/integration/jobs",
+      {
+        payload: { namespace: "42", walSequence: 1 },
+      },
+      { "idempotency-key": "wal-1" },
+    );
     expect(duplicatePush.status).toBe(200);
     const duplicate = await duplicatePush.json<PushResponse>();
     expect(duplicate.duplicate).toBe(true);
@@ -27,22 +35,19 @@ describe("queue Worker", () => {
     const leaseToken = claim.jobs[0]?.lease?.token;
     expect(leaseToken).toBeTypeOf("string");
 
-    const wrongCompletion = await post(
-      `/queues/integration/jobs/${first.job.id}/complete`,
-      { leaseToken: "wrong-token" },
-    );
+    const wrongCompletion = await post(`/queues/integration/jobs/${first.job.id}/complete`, {
+      leaseToken: "wrong-token",
+    });
     expect(wrongCompletion.status).toBe(409);
 
-    const heartbeat = await post(
-      `/queues/integration/jobs/${first.job.id}/heartbeat`,
-      { leaseToken },
-    );
+    const heartbeat = await post(`/queues/integration/jobs/${first.job.id}/heartbeat`, {
+      leaseToken,
+    });
     expect(heartbeat.status).toBe(200);
 
-    const completion = await post(
-      `/queues/integration/jobs/${first.job.id}/complete`,
-      { leaseToken },
-    );
+    const completion = await post(`/queues/integration/jobs/${first.job.id}/complete`, {
+      leaseToken,
+    });
     expect(completion.status).toBe(200);
 
     const stateResponse = await exports.default.fetch("https://queue.test/queues/integration");
@@ -74,7 +79,11 @@ describe("queue Worker", () => {
   });
 });
 
-function post(path: string, body: unknown, headers: Record<string, string> = {}): Promise<Response> {
+function post(
+  path: string,
+  body: unknown,
+  headers: Record<string, string> = {},
+): Promise<Response> {
   return exports.default.fetch(`https://queue.test${path}`, {
     method: "POST",
     headers: { "content-type": "application/json", ...headers },

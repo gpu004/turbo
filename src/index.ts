@@ -25,17 +25,16 @@ export default {
         return json({ error: { code: error.code, message: error.message } }, error.status);
       }
 
-      console.error(JSON.stringify({
-        level: "error",
-        event: "request_failed",
-        method: request.method,
-        path: new URL(request.url).pathname,
-        error: error instanceof Error ? error.message : String(error),
-      }));
-      return json(
-        { error: { code: "internal_error", message: "queue operation failed" } },
-        500,
+      console.error(
+        JSON.stringify({
+          level: "error",
+          event: "request_failed",
+          method: request.method,
+          path: new URL(request.url).pathname,
+          error: error instanceof Error ? error.message : String(error),
+        }),
       );
+      return json({ error: { code: "internal_error", message: "queue operation failed" } }, 500);
     }
   },
 } satisfies ExportedHandler<Env>;
@@ -53,7 +52,11 @@ async function route(request: Request, env: Env): Promise<Response> {
 
   const queue = segments[1];
   if (!QUEUE_NAME.test(queue)) {
-    throw new HttpError(400, "invalid_queue", "queue name must match [A-Za-z0-9][A-Za-z0-9._-]{0,127}");
+    throw new HttpError(
+      400,
+      "invalid_queue",
+      "queue name must match [A-Za-z0-9][A-Za-z0-9._-]{0,127}",
+    );
   }
 
   const broker = env.QUEUE_BROKER.getByName(queue);
@@ -68,7 +71,8 @@ async function route(request: Request, env: Env): Promise<Response> {
       throw new HttpError(400, "invalid_body", "payload is required");
     }
     const headerKey = request.headers.get("idempotency-key")?.trim();
-    const bodyKey = typeof input.idempotencyKey === "string" ? input.idempotencyKey.trim() : undefined;
+    const bodyKey =
+      typeof input.idempotencyKey === "string" ? input.idempotencyKey.trim() : undefined;
     const idempotencyKey = headerKey || bodyKey;
     if (idempotencyKey && idempotencyKey.length > MAX_IDEMPOTENCY_KEY_LENGTH) {
       throw new HttpError(400, "invalid_idempotency_key", "idempotency key is too long");
@@ -100,9 +104,10 @@ async function route(request: Request, env: Env): Promise<Response> {
   ) {
     const input = await readJson(request, env);
     const leaseToken = requireString(input, "leaseToken", 200);
-    const resultJson = segments[4] === "heartbeat"
-      ? await broker.heartbeat(queue, jobId, leaseToken)
-      : await broker.complete(queue, jobId, leaseToken);
+    const resultJson =
+      segments[4] === "heartbeat"
+        ? await broker.heartbeat(queue, jobId, leaseToken)
+        : await broker.complete(queue, jobId, leaseToken);
     const result = parseBrokerResult<MutationResult>(resultJson);
     return mutationResponse(result);
   }
@@ -171,7 +176,11 @@ function parseSegments(pathname: string): string[] {
 function requireString(input: Record<string, unknown>, key: string, maxLength: number): string {
   const value = input[key];
   if (typeof value !== "string" || value.trim().length === 0 || value.length > maxLength) {
-    throw new HttpError(400, "invalid_body", `${key} must be a non-empty string no longer than ${maxLength} characters`);
+    throw new HttpError(
+      400,
+      "invalid_body",
+      `${key} must be a non-empty string no longer than ${maxLength} characters`,
+    );
   }
   return value.trim();
 }
@@ -184,7 +193,11 @@ function requireInteger(
 ): number {
   const value = input[key];
   if (!Number.isInteger(value) || (value as number) < minimum || (value as number) > maximum) {
-    throw new HttpError(400, "invalid_body", `${key} must be an integer from ${minimum} to ${maximum}`);
+    throw new HttpError(
+      400,
+      "invalid_body",
+      `${key} must be an integer from ${minimum} to ${maximum}`,
+    );
   }
   return value as number;
 }

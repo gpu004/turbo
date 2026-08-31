@@ -23,10 +23,14 @@ The JSON-file design rewrites the whole queue on each group commit. It is meant 
 npm install
 npm run types
 npm test
+npm run lint
+npm run format:check
 npm run dev
 ```
 
 Wrangler simulates both R2 and Durable Objects locally.
+
+`npm run lint` uses Oxlint. `npm run format` writes Oxfmt formatting, and `npm run format:check` verifies it without changing files. `npm run check` runs linting, formatting checks, the Wrangler dry run, and TypeScript checking.
 
 ## API
 
