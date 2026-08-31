@@ -122,9 +122,7 @@ export function applyBatch(source: QueueFile, mutations: QueueMutation[]): Batch
           enqueuedAt: mutation.now,
           attempts: 0,
           state: "pending",
-          ...(mutation.idempotencyKey
-            ? { idempotencyKey: mutation.idempotencyKey }
-            : {}),
+          ...(mutation.idempotencyKey ? { idempotencyKey: mutation.idempotencyKey } : {}),
         };
         file.jobs.push(job);
         results.push({ ok: true, kind: "push", job, duplicate: false });

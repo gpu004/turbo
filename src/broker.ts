@@ -31,11 +31,7 @@ export class QueueBroker extends DurableObject<Env> {
   private pending: PendingMutation[] = [];
   private flushPromise: Promise<void> | undefined;
 
-  async push(
-    queue: string,
-    payloadJson: string,
-    idempotencyKey?: string,
-  ): Promise<string> {
+  async push(queue: string, payloadJson: string, idempotencyKey?: string): Promise<string> {
     this.bindQueue(queue);
     const result = await this.enqueue({
       kind: "push",
@@ -144,15 +140,18 @@ export class QueueBroker extends DurableObject<Env> {
       if (!applied.changed) return applied.results;
 
       const body = JSON.stringify(applied.file);
-      const maxBytes = this.integerSetting("MAX_QUEUE_BYTES", 8 * 1024 * 1024, 1_024, 32 * 1024 * 1024);
+      const maxBytes = this.integerSetting(
+        "MAX_QUEUE_BYTES",
+        8 * 1024 * 1024,
+        1_024,
+        32 * 1024 * 1024,
+      );
       if (new TextEncoder().encode(body).byteLength > maxBytes) {
         throw new Error(`queue exceeds configured MAX_QUEUE_BYTES of ${maxBytes}`);
       }
 
       const stored = await this.env.QUEUE_BUCKET.put(this.objectKey(queue), body, {
-        onlyIf: snapshot.etag
-          ? { etagMatches: snapshot.etag }
-          : { etagDoesNotMatch: "*" },
+        onlyIf: snapshot.etag ? { etagMatches: snapshot.etag } : { etagDoesNotMatch: "*" },
         httpMetadata: { contentType: "application/json" },
       });
 
@@ -195,9 +194,7 @@ export class QueueBroker extends DurableObject<Env> {
     maximum: number,
   ): number {
     const parsed = Number.parseInt(this.env[name], 10);
-    return Number.isFinite(parsed) && parsed >= minimum && parsed <= maximum
-      ? parsed
-      : fallback;
+    return Number.isFinite(parsed) && parsed >= minimum && parsed <= maximum ? parsed : fallback;
   }
 }
 

@@ -16,10 +16,7 @@ describe("queue model", () => {
   });
 
   it("claims in FIFO order and fences a reassigned lease", () => {
-    const queued = applyBatch(emptyQueue("indexing", NOW), [
-      push("job-1"),
-      push("job-2"),
-    ]).file;
+    const queued = applyBatch(emptyQueue("indexing", NOW), [push("job-1"), push("job-2")]).file;
     const firstClaim = applyBatch(queued, [claim("worker-a", ["lease-a"], NOW)]);
     expect(firstClaim.results[0]).toMatchObject({
       ok: true,
@@ -35,12 +32,14 @@ describe("queue model", () => {
       jobs: [{ id: "job-1", attempts: 2 }],
     });
 
-    const oldCompletion = applyBatch(secondClaim.file, [{
-      kind: "complete",
-      jobId: "job-1",
-      leaseToken: "lease-a",
-      now: afterExpiry,
-    }]);
+    const oldCompletion = applyBatch(secondClaim.file, [
+      {
+        kind: "complete",
+        jobId: "job-1",
+        leaseToken: "lease-a",
+        now: afterExpiry,
+      },
+    ]);
     expect(oldCompletion.results[0]).toMatchObject({ ok: false, code: "lease_mismatch" });
     expect(oldCompletion.file.jobs).toHaveLength(2);
   });
@@ -49,25 +48,29 @@ describe("queue model", () => {
     const queued = applyBatch(emptyQueue("indexing", NOW), [push("job-1")]).file;
     const leased = applyBatch(queued, [claim("worker-a", ["lease-a"], NOW)]).file;
     const heartbeatAt = "2026-08-31T12:00:30.000Z";
-    const heartbeat = applyBatch(leased, [{
-      kind: "heartbeat",
-      jobId: "job-1",
-      leaseToken: "lease-a",
-      leaseSeconds: 60,
-      now: heartbeatAt,
-    }]);
+    const heartbeat = applyBatch(leased, [
+      {
+        kind: "heartbeat",
+        jobId: "job-1",
+        leaseToken: "lease-a",
+        leaseSeconds: 60,
+        now: heartbeatAt,
+      },
+    ]);
     expect(heartbeat.results[0]).toMatchObject({
       ok: true,
       kind: "heartbeat",
       job: { lease: { expiresAt: "2026-08-31T12:01:30.000Z" } },
     });
 
-    const completed = applyBatch(heartbeat.file, [{
-      kind: "complete",
-      jobId: "job-1",
-      leaseToken: "lease-a",
-      now: heartbeatAt,
-    }]);
+    const completed = applyBatch(heartbeat.file, [
+      {
+        kind: "complete",
+        jobId: "job-1",
+        leaseToken: "lease-a",
+        now: heartbeatAt,
+      },
+    ]);
     expect(completed.file.jobs).toEqual([]);
     expect(completed.results[0]).toMatchObject({
       ok: true,
