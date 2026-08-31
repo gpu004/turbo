@@ -1,0 +1,37 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "turbo-r2-queue",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-31",
+  "compatibility_flags": ["nodejs_compat"],
+  "r2_buckets": [
+    {
+      "binding": "QUEUE_BUCKET",
+      "bucket_name": "turbo-queues"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "QUEUE_BROKER",
+        "class_name": "QueueBroker"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["QueueBroker"]
+    }
+  ],
+  "vars": {
+    "QUEUE_BATCH_WINDOW_MS": "5",
+    "QUEUE_LEASE_SECONDS": "60",
+    "MAX_QUEUE_BYTES": "8388608",
+    "MAX_REQUEST_BYTES": "262144"
+  },
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  }
+}
