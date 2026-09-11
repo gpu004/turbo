@@ -14,12 +14,12 @@
     "types": "wrangler types"
   },
   "devDependencies": {
-    "@cloudflare/vitest-plugin": "1.1.0",
+    "@cloudflare/vitest-plugin": "1.1.7",
     "@types/node": "^24.3.0",
     "oxfmt": "^0.65.0",
     "oxlint": "^1.80.0",
     "typescript": "^7.0.2",
     "vitest": "^4.1.11",
-    "wrangler": "4.124.0"
+    "wrangler": "4.131.0"
   }
 }
