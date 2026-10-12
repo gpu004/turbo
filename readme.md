@@ -94,3 +94,7 @@ The defaults live in `wrangler.jsonc`:
 | `MAX_REQUEST_BYTES` | `262144` | Maximum JSON request body size |
 
 Each named queue uses its own Durable Object and R2 key. Split a hot logical workload across queue names when one broker reaches its request-rate limit.
+
+## License
+
+[MIT](LICENSE).
