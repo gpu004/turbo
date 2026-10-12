@@ -174,7 +174,7 @@ async function readJson<T>(request: Request, env: Env, schema: z.ZodType<T>): Pr
   if (!request.body) throw new HttpError(400, "invalid_json", "JSON request body is required");
 
   const maxBytes = boundedInteger(env.MAX_REQUEST_BYTES, 256 * 1024, 1_024, 4 * 1024 * 1024);
-  const declaredLength = Math.trunc(Number(request.headers.get("content-length") ?? ""));
+  const declaredLength = Number.parseInt(request.headers.get("content-length") ?? "", 10);
 
   if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
     throw new HttpError(413, "body_too_large", `request body exceeds ${maxBytes} bytes`);
@@ -244,7 +244,7 @@ function stringField(key: string, maxLength: number): z.ZodString {
 }
 
 function boundedInteger(value: string, fallback: number, minimum: number, maximum: number): number {
-  const parsed = Math.trunc(Number(value));
+  const parsed = Number.parseInt(value, 10);
 
   return Number.isFinite(parsed) && parsed >= minimum && parsed <= maximum ? parsed : fallback;
 }
