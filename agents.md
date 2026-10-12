@@ -21,3 +21,4 @@ Broker → one R2 `queue.json` per queue, updated with etag CAS
 - After editing `wrangler.jsonc` vars, rerun `npm run types`; `worker-configuration.d.ts` is gitignored.
 - Tests run in workerd via `@cloudflare/vitest-plugin`; no Cloudflare account is needed.
 - Remote R2's one-write-per-second-per-key limit is not simulated locally.
+- `npm run lint` includes the vendored anti-slop plugin.

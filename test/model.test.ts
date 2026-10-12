@@ -1,7 +1,30 @@
 import { describe, expect, it } from "vitest";
-import { applyBatch, emptyQueue, type QueueMutation } from "../src/model";
+import { applyBatch, emptyQueue, parseQueueFile, type QueueMutation } from "../src/model";
 
 const NOW = "2026-08-31T12:00:00.000Z";
+
+describe("queue file parser", () => {
+  it("parses a valid queue file", () => {
+    const file = emptyQueue("q", NOW);
+
+    expect(parseQueueFile(JSON.stringify(file), "q")).toEqual(file);
+  });
+
+  it("rejects a queue file for a different queue", () => {
+    const file = emptyQueue("other", NOW);
+
+    expect(() => parseQueueFile(JSON.stringify(file), "q")).toThrow(
+      "R2 object for queue q has an incompatible format",
+    );
+  });
+
+  it("rejects invalid JSON and malformed queue files", () => {
+    expect(() => parseQueueFile("not json", "q")).toThrow("R2 object for queue q is malformed");
+    expect(() => parseQueueFile('{"version":1,"queue":"q","jobs":"x"}', "q")).toThrow(
+      "R2 object for queue q is malformed",
+    );
+  });
+});
 
 describe("queue model", () => {
   it("deduplicates pushes by idempotency key", () => {
@@ -40,6 +63,7 @@ describe("queue model", () => {
         now: afterExpiry,
       },
     ]);
+
     expect(oldCompletion.results[0]).toMatchObject({ ok: false, code: "lease_mismatch" });
     expect(oldCompletion.file.jobs).toHaveLength(2);
   });
@@ -48,6 +72,7 @@ describe("queue model", () => {
     const queued = applyBatch(emptyQueue("indexing", NOW), [push("job-1")]).file;
     const leased = applyBatch(queued, [claim("worker-a", ["lease-a"], NOW)]).file;
     const heartbeatAt = "2026-08-31T12:00:30.000Z";
+
     const heartbeat = applyBatch(leased, [
       {
         kind: "heartbeat",
@@ -57,6 +82,7 @@ describe("queue model", () => {
         now: heartbeatAt,
       },
     ]);
+
     expect(heartbeat.results[0]).toMatchObject({
       ok: true,
       kind: "heartbeat",
@@ -71,6 +97,7 @@ describe("queue model", () => {
         now: heartbeatAt,
       },
     ]);
+
     expect(completed.file.jobs).toEqual([]);
     expect(completed.results[0]).toMatchObject({
       ok: true,
@@ -81,13 +108,16 @@ describe("queue model", () => {
 });
 
 function push(id: string, idempotencyKey?: string): QueueMutation {
-  return {
+  const mutation: Extract<QueueMutation, { kind: "push" }> = {
     kind: "push",
     id,
     payload: { id },
-    ...(idempotencyKey ? { idempotencyKey } : {}),
     now: NOW,
   };
+
+  if (idempotencyKey) mutation.idempotencyKey = idempotencyKey;
+
+  return mutation;
 }
 
 function claim(workerId: string, leaseTokens: string[], now: string): QueueMutation {
