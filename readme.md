@@ -1,6 +1,6 @@
 # turbo
 
-`turbo` is a small distributed job queue built around one JSON object per queue in Cloudflare R2.
+`turbo` is a distributed job queue that stores each queue as one JSON object in Cloudflare R2.
 
 Clients talk to a Worker. The Worker routes every operation for a named queue to the same Durable Object broker. The broker batches concurrent pushes, claims, heartbeats, and completions into one conditional R2 write. It replies only after R2 accepts that write.
 
@@ -15,7 +15,7 @@ R2 is the durable record. Durable Objects coordinate access, but the broker can 
 - conditional R2 writes, so an unexpected second writer cannot silently overwrite the queue
 - one broker per queue, which avoids a global Durable Object bottleneck
 
-The JSON-file design rewrites the whole queue on each group commit. It is meant for queues whose metadata stays comfortably below the configured 8 MiB default. Job payloads should contain references to large data, not the data itself. The lower cap leaves room for the source object, the updated copy, and serialized JSON inside Cloudflare's 128 MB isolate limit.
+Each group commit rewrites the whole queue. Keep queue metadata below the default 8 MiB cap. Job payloads should reference large data rather than contain it. The cap leaves room for the source object, the updated copy, and serialized JSON within Cloudflare's 128 MB isolate limit.
 
 ## Run it locally
 
@@ -32,7 +32,9 @@ Git hooks install automatically on `npm install`. CI runs `npm run types`, `npm 
 
 Wrangler simulates both R2 and Durable Objects locally.
 
-`npm run lint` uses Oxlint with the vendored anti-slop plugin at `tools/oxlint/anti-slop` (see `tools/oxlint/anti-slop/UPSTREAM.md`). `npm run format` writes Oxfmt formatting, and `npm run format:check` verifies it without changing files. `npm run check` runs linting, formatting checks, the Wrangler dry run, and TypeScript checking.
+`npm run lint` uses Oxlint with the vendored anti-slop plugin at `tools/oxlint/anti-slop`. See the [upstream record](tools/oxlint/anti-slop/UPSTREAM.md) for its source and local changes.
+
+`npm run format` formats files with Oxfmt. `npm run format:check` checks formatting without changing files. `npm run check` runs linting, formatting checks, a Wrangler dry run, and TypeScript checking.
 
 ## API
 
@@ -53,7 +55,7 @@ curl -s http://localhost:8787/queues/indexing/claims \
   --data '{"workerId":"indexer-7","maxJobs":10}'
 ```
 
-The claim response contains a `leaseToken` for each job. Send it with heartbeats and completion calls:
+Each job in the claim response contains a token at `lease.token`. Send that token as `leaseToken` with heartbeats and completion calls:
 
 ```sh
 curl -s http://localhost:8787/queues/indexing/jobs/JOB_ID/heartbeat \
@@ -82,7 +84,7 @@ npx wrangler r2 bucket create turbo-queues
 npm run deploy
 ```
 
-Put the API behind Cloudflare Access or a private service binding before using it with production jobs. This repository does not ship a shared secret in source or Wrangler configuration.
+Put the API behind Cloudflare Access or a private service binding before using it with production jobs. Neither the source nor the Wrangler configuration includes a shared secret.
 
 ## Configuration
 
@@ -95,4 +97,8 @@ The defaults live in `wrangler.jsonc`:
 | `MAX_QUEUE_BYTES` | `8388608` | Maximum serialized queue object size |
 | `MAX_REQUEST_BYTES` | `262144` | Maximum JSON request body size |
 
-Each named queue uses its own Durable Object and R2 key. Split a hot logical workload across queue names when one broker reaches its request-rate limit.
+Each named queue uses its own Durable Object and R2 key. Split work across queue names when one broker reaches its request-rate limit.
+
+## License
+
+[MIT](LICENSE).
