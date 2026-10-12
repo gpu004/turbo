@@ -1,3 +1,5 @@
+import { z } from "zod";
+
 export type JsonValue =
   | null
   | boolean
@@ -5,6 +7,17 @@ export type JsonValue =
   | string
   | JsonValue[]
   | { [key: string]: JsonValue };
+
+export const JsonValueSchema: z.ZodType<JsonValue> = z.lazy(() =>
+  z.union([
+    z.null(),
+    z.boolean(),
+    z.number(),
+    z.string(),
+    z.array(JsonValueSchema),
+    z.record(z.string(), JsonValueSchema),
+  ]),
+);
 
 export interface Lease {
   token: string;
@@ -34,6 +47,43 @@ export interface QueueFile {
   updatedAt: string;
   jobs: QueueJob[];
 }
+
+const LeaseSchema: z.ZodType<Lease> = z
+  .object({
+    token: z.string(),
+    workerId: z.string(),
+    heartbeatAt: z.string(),
+    expiresAt: z.string(),
+  })
+  .passthrough();
+
+const QueueJobSchema: z.ZodType<QueueJob> = z
+  .object({
+    id: z.string(),
+    payload: JsonValueSchema,
+    idempotencyKey: z.string().exactOptional(),
+    enqueuedAt: z.string(),
+    attempts: z.number(),
+    state: z.enum(["pending", "leased"]),
+    lease: LeaseSchema.exactOptional(),
+  })
+  .passthrough();
+
+const QueueFileSchema: z.ZodType<QueueFile> = z
+  .object({
+    version: z.literal(1),
+    queue: z.string(),
+    broker: z
+      .object({
+        kind: z.literal("durable-object"),
+        name: z.string(),
+      })
+      .passthrough(),
+    revision: z.number(),
+    updatedAt: z.string(),
+    jobs: z.array(QueueJobSchema),
+  })
+  .passthrough();
 
 export type QueueMutation =
   | {
@@ -83,6 +133,53 @@ export type MutationResult =
       message: string;
     };
 
+const MutationFailureSchema = z.object({
+  ok: z.literal(false),
+  code: z.enum(["job_not_found", "lease_mismatch", "lease_expired"]),
+  message: z.string(),
+});
+
+export const PushResultSchema: z.ZodType<Extract<MutationResult, { kind: "push" }>> = z.object({
+  ok: z.literal(true),
+  kind: z.literal("push"),
+  job: QueueJobSchema,
+  duplicate: z.boolean(),
+});
+
+export const ClaimResultSchema: z.ZodType<Extract<MutationResult, { kind: "claim" }>> = z.object({
+  ok: z.literal(true),
+  kind: z.literal("claim"),
+  jobs: z.array(QueueJobSchema),
+});
+
+export const HeartbeatResultSchema: z.ZodType<Extract<MutationResult, { kind: "heartbeat" }>> =
+  z.union([
+    z.object({
+      ok: z.literal(true),
+      kind: z.literal("heartbeat"),
+      job: QueueJobSchema,
+    }),
+    MutationFailureSchema.extend({ kind: z.literal("heartbeat") }),
+  ]);
+
+export const CompleteResultSchema: z.ZodType<Extract<MutationResult, { kind: "complete" }>> =
+  z.union([
+    z.object({
+      ok: z.literal(true),
+      kind: z.literal("complete"),
+      jobId: z.string(),
+      alreadyCompleted: z.boolean(),
+    }),
+    MutationFailureSchema.extend({ kind: z.literal("complete") }),
+  ]);
+
+export const MutationResultSchema: z.ZodType<MutationResult> = z.union([
+  PushResultSchema,
+  ClaimResultSchema,
+  HeartbeatResultSchema,
+  CompleteResultSchema,
+]);
+
 export interface BatchResult {
   file: QueueFile;
   results: MutationResult[];
@@ -123,8 +220,9 @@ export function applyBatch(source: QueueFile, mutations: QueueMutation[]): Batch
           enqueuedAt: mutation.now,
           attempts: 0,
           state: "pending",
-          ...(mutation.idempotencyKey ? { idempotencyKey: mutation.idempotencyKey } : {}),
         };
+
+        if (mutation.idempotencyKey) job.idempotencyKey = mutation.idempotencyKey;
 
         file.jobs.push(job);
         results.push({ ok: true, kind: "push", job, duplicate: false });
@@ -174,7 +272,7 @@ export function applyBatch(source: QueueFile, mutations: QueueMutation[]): Batch
 
         const nowMs = Date.parse(mutation.now);
         result.job.lease = {
-          ...result.job.lease,
+          ...result.lease,
           heartbeatAt: mutation.now,
           expiresAt: new Date(nowMs + mutation.leaseSeconds * 1_000).toISOString(),
         };
@@ -234,7 +332,7 @@ function validateLease(
   leaseToken: string,
   now: string,
 ):
-  | { ok: true; job: QueueJob & { lease: Lease } }
+  | { ok: true; job: QueueJob; lease: Lease }
   | {
       ok: false;
       code: "job_not_found" | "lease_mismatch" | "lease_expired";
@@ -254,19 +352,24 @@ function validateLease(
     return { ok: false, code: "lease_expired", message: "job lease has expired" };
   }
 
-  return { ok: true, job: job as QueueJob & { lease: Lease } };
+  return { ok: true, job, lease: job.lease };
 }
 
-export function assertQueueFile(value: unknown, expectedQueue: string): asserts value is QueueFile {
-  if (!isRecord(value) || value.version !== 1 || value.queue !== expectedQueue) {
+export function parseQueueFile(value: JsonValue, expectedQueue: string): QueueFile {
+  const identity = z
+    .object({ version: z.literal(1), queue: z.string() })
+    .passthrough()
+    .safeParse(value);
+
+  if (!identity.success || identity.data.queue !== expectedQueue) {
     throw new Error(`R2 object for queue ${expectedQueue} has an incompatible format`);
   }
 
-  if (!Array.isArray(value.jobs) || typeof value.revision !== "number") {
+  const file = QueueFileSchema.safeParse(value);
+
+  if (!file.success) {
     throw new Error(`R2 object for queue ${expectedQueue} is malformed`);
   }
-}
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
+  return file.data;
 }

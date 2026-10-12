@@ -1,11 +1,49 @@
 import { QueueBroker } from "./broker";
-import type { MutationResult } from "./model";
+import {
+  ClaimResultSchema,
+  CompleteResultSchema,
+  HeartbeatResultSchema,
+  JsonValueSchema,
+  PushResultSchema,
+  type MutationResult,
+} from "./model";
+import { z } from "zod";
 
 export { QueueBroker };
 
 const QUEUE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 
 const MAX_IDEMPOTENCY_KEY_LENGTH = 200;
+
+const requestObjectError = "request body must be a JSON object";
+
+const invalidPayloadError = "payload is required";
+
+const PushBodySchema = z.object(
+  {
+    payload: JsonValueSchema,
+    idempotencyKey: z.string().optional().catch(undefined),
+  },
+  { error: requestObjectError },
+);
+
+const ClaimBodySchema = z.object(
+  {
+    workerId: stringField("workerId", 200),
+    maxJobs: z
+      .number({ error: "maxJobs must be an integer from 1 to 100" })
+      .int("maxJobs must be an integer from 1 to 100")
+      .min(1, "maxJobs must be an integer from 1 to 100")
+      .max(100, "maxJobs must be an integer from 1 to 100")
+      .default(1),
+  },
+  { error: requestObjectError },
+);
+
+const LeaseBodySchema = z.object(
+  { leaseToken: stringField("leaseToken", 200) },
+  { error: requestObjectError },
+);
 
 class HttpError extends Error {
   constructor(
@@ -71,16 +109,10 @@ async function route(request: Request, env: Env): Promise<Response> {
   }
 
   if (request.method === "POST" && segments[2] === "jobs" && segments.length === 3) {
-    const input = await readJson(request, env);
-
-    if (!hasOwn(input, "payload")) {
-      throw new HttpError(400, "invalid_body", "payload is required");
-    }
-
+    const input = await readJson(request, env, PushBodySchema);
     const headerKey = request.headers.get("idempotency-key")?.trim();
 
-    const bodyKey =
-      typeof input.idempotencyKey === "string" ? input.idempotencyKey.trim() : undefined;
+    const bodyKey = input.idempotencyKey?.trim();
 
     const idempotencyKey = headerKey || bodyKey;
 
@@ -88,20 +120,18 @@ async function route(request: Request, env: Env): Promise<Response> {
       throw new HttpError(400, "invalid_idempotency_key", "idempotency key is too long");
     }
 
-    const result = parseBrokerResult<Extract<MutationResult, { kind: "push" }>>(
-      await broker.push(queue, JSON.stringify(input.payload), idempotencyKey),
+    const result = PushResultSchema.parse(
+      JSON.parse(await broker.push(queue, JSON.stringify(input.payload), idempotencyKey)),
     );
 
     return json(result, result.duplicate ? 200 : 201);
   }
 
   if (request.method === "POST" && segments[2] === "claims" && segments.length === 3) {
-    const input = await readJson(request, env);
-    const workerId = requireString(input, "workerId", 200);
-    const maxJobs = input.maxJobs === undefined ? 1 : requireInteger(input, "maxJobs", 1, 100);
+    const input = await readJson(request, env, ClaimBodySchema);
 
-    const result = parseBrokerResult<Extract<MutationResult, { kind: "claim" }>>(
-      await broker.claim(queue, workerId, maxJobs),
+    const result = ClaimResultSchema.parse(
+      JSON.parse(await broker.claim(queue, input.workerId, input.maxJobs)),
     );
 
     return json(result);
@@ -116,15 +146,16 @@ async function route(request: Request, env: Env): Promise<Response> {
     (segments[4] === "heartbeat" || segments[4] === "complete") &&
     segments.length === 5
   ) {
-    const input = await readJson(request, env);
-    const leaseToken = requireString(input, "leaseToken", 200);
+    const input = await readJson(request, env, LeaseBodySchema);
 
-    const resultJson =
+    const result =
       segments[4] === "heartbeat"
-        ? await broker.heartbeat(queue, jobId, leaseToken)
-        : await broker.complete(queue, jobId, leaseToken);
-
-    const result = parseBrokerResult<MutationResult>(resultJson);
+        ? HeartbeatResultSchema.parse(
+            JSON.parse(await broker.heartbeat(queue, jobId, input.leaseToken)),
+          )
+        : CompleteResultSchema.parse(
+            JSON.parse(await broker.complete(queue, jobId, input.leaseToken)),
+          );
 
     return mutationResponse(result);
   }
@@ -139,7 +170,7 @@ function mutationResponse(result: MutationResult): Response {
   return json({ error: { code: result.code, message: result.message } }, status);
 }
 
-async function readJson(request: Request, env: Env): Promise<Record<string, unknown>> {
+async function readJson<T>(request: Request, env: Env, schema: z.ZodType<T>): Promise<T> {
   if (!request.body) throw new HttpError(400, "invalid_json", "JSON request body is required");
 
   const maxBytes = boundedInteger(env.MAX_REQUEST_BYTES, 256 * 1024, 1_024, 4 * 1024 * 1024);
@@ -183,11 +214,16 @@ async function readJson(request: Request, env: Env): Promise<Record<string, unkn
     throw new HttpError(400, "invalid_json", "request body is not valid JSON");
   }
 
-  if (!isRecord(value)) {
-    throw new HttpError(400, "invalid_body", "request body must be a JSON object");
+  const parsed = schema.safeParse(value);
+
+  if (!parsed.success) {
+    const issue = parsed.error.issues[0];
+    const message = issue?.path[0] === "payload" ? invalidPayloadError : issue?.message;
+
+    throw new HttpError(400, "invalid_body", message ?? "request body is invalid");
   }
 
-  return value;
+  return parsed.data;
 }
 
 function parseSegments(pathname: string): string[] {
@@ -198,37 +234,10 @@ function parseSegments(pathname: string): string[] {
   }
 }
 
-function requireString(input: Record<string, unknown>, key: string, maxLength: number): string {
-  const value = input[key];
+function stringField(key: string, maxLength: number): z.ZodString {
+  const message = `${key} must be a non-empty string no longer than ${maxLength} characters`;
 
-  if (typeof value !== "string" || value.trim().length === 0 || value.length > maxLength) {
-    throw new HttpError(
-      400,
-      "invalid_body",
-      `${key} must be a non-empty string no longer than ${maxLength} characters`,
-    );
-  }
-
-  return value.trim();
-}
-
-function requireInteger(
-  input: Record<string, unknown>,
-  key: string,
-  minimum: number,
-  maximum: number,
-): number {
-  const value = input[key];
-
-  if (!Number.isInteger(value) || (value as number) < minimum || (value as number) > maximum) {
-    throw new HttpError(
-      400,
-      "invalid_body",
-      `${key} must be an integer from ${minimum} to ${maximum}`,
-    );
-  }
-
-  return value as number;
+  return z.string({ error: message }).max(maxLength, message).trim().min(1, message);
 }
 
 function boundedInteger(value: string, fallback: number, minimum: number, maximum: number): number {
@@ -237,15 +246,12 @@ function boundedInteger(value: string, fallback: number, minimum: number, maximu
   return Number.isFinite(parsed) && parsed >= minimum && parsed <= maximum ? parsed : fallback;
 }
 
-function hasOwn(input: Record<string, unknown>, key: string): boolean {
-  return Object.prototype.hasOwnProperty.call(input, key);
-}
+type JsonResponseBody =
+  | MutationResult
+  | { error: { code: string; message: string } }
+  | { ok: true };
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function json(value: unknown, status = 200): Response {
+function json(value: JsonResponseBody, status = 200): Response {
   return Response.json(value, {
     status,
     headers: { "cache-control": "no-store" },
@@ -260,8 +266,4 @@ function jsonText(value: string, status = 200): Response {
       "content-type": "application/json; charset=utf-8",
     },
   });
-}
-
-function parseBrokerResult<T extends MutationResult>(value: string): T {
-  return JSON.parse(value) as T;
 }

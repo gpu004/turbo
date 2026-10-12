@@ -1,10 +1,10 @@
 import { DurableObject } from "cloudflare:workers";
 import {
   applyBatch,
-  assertQueueFile,
   emptyQueue,
+  parseQueueFile,
+  JsonValueSchema,
   type MutationResult,
-  type JsonValue,
   type QueueFile,
   type QueueMutation,
 } from "./model";
@@ -17,16 +17,8 @@ interface Snapshot {
 interface PendingMutation {
   mutation: QueueMutation;
   resolve: (result: MutationResult) => void;
-  reject: (error: unknown) => void;
+  reject: (cause: unknown) => void;
 }
-
-type PushResult = Extract<MutationResult, { kind: "push" }>;
-
-type ClaimResult = Extract<MutationResult, { kind: "claim" }>;
-
-type HeartbeatResult = Extract<MutationResult, { kind: "heartbeat" }>;
-
-type CompleteResult = Extract<MutationResult, { kind: "complete" }>;
 
 export class QueueBroker extends DurableObject<Env> {
   private snapshot: Snapshot | undefined;
@@ -37,17 +29,19 @@ export class QueueBroker extends DurableObject<Env> {
   async push(queue: string, payloadJson: string, idempotencyKey?: string): Promise<string> {
     this.bindQueue(queue);
 
-    const result = await this.enqueue({
+    const mutation: Extract<QueueMutation, { kind: "push" }> = {
       kind: "push",
       id: crypto.randomUUID(),
-      payload: JSON.parse(payloadJson) as JsonValue,
-      ...(idempotencyKey ? { idempotencyKey } : {}),
+      payload: JsonValueSchema.parse(JSON.parse(payloadJson)),
       now: new Date().toISOString(),
-    });
+    };
+
+    if (idempotencyKey) mutation.idempotencyKey = idempotencyKey;
+    const result = await this.enqueue(mutation);
 
     if (result.kind !== "push") throw new Error("broker returned the wrong mutation result");
 
-    return JSON.stringify(result satisfies PushResult);
+    return JSON.stringify(result);
   }
 
   async claim(queue: string, workerId: string, maxJobs: number): Promise<string> {
@@ -64,7 +58,7 @@ export class QueueBroker extends DurableObject<Env> {
 
     if (result.kind !== "claim") throw new Error("broker returned the wrong mutation result");
 
-    return JSON.stringify(result satisfies ClaimResult);
+    return JSON.stringify(result);
   }
 
   async heartbeat(queue: string, jobId: string, leaseToken: string): Promise<string> {
@@ -80,7 +74,7 @@ export class QueueBroker extends DurableObject<Env> {
 
     if (result.kind !== "heartbeat") throw new Error("broker returned the wrong mutation result");
 
-    return JSON.stringify(result satisfies HeartbeatResult);
+    return JSON.stringify(result);
   }
 
   async complete(queue: string, jobId: string, leaseToken: string): Promise<string> {
@@ -95,7 +89,7 @@ export class QueueBroker extends DurableObject<Env> {
 
     if (result.kind !== "complete") throw new Error("broker returned the wrong mutation result");
 
-    return JSON.stringify(result satisfies CompleteResult);
+    return JSON.stringify(result);
   }
 
   async inspect(queue: string): Promise<string> {
@@ -203,9 +197,8 @@ export class QueueBroker extends DurableObject<Env> {
       return snapshot;
     }
 
-    const value: unknown = await object.json();
-    assertQueueFile(value, queue);
-    const snapshot = { file: value, etag: object.etag };
+    const value = JsonValueSchema.parse(await object.json());
+    const snapshot = { file: parseQueueFile(value, queue), etag: object.etag };
     this.snapshot = snapshot;
 
     return snapshot;

@@ -85,13 +85,16 @@ describe("queue model", () => {
 });
 
 function push(id: string, idempotencyKey?: string): QueueMutation {
-  return {
+  const mutation: Extract<QueueMutation, { kind: "push" }> = {
     kind: "push",
     id,
     payload: { id },
-    ...(idempotencyKey ? { idempotencyKey } : {}),
     now: NOW,
   };
+
+  if (idempotencyKey) mutation.idempotencyKey = idempotencyKey;
+
+  return mutation;
 }
 
 function claim(workerId: string, leaseTokens: string[], now: string): QueueMutation {

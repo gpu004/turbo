@@ -1,5 +1,6 @@
 import { exports } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
+import type { JsonValue } from "../src/model";
 
 describe("queue Worker", () => {
   it("pushes, deduplicates, claims, heartbeats, and completes a job", async () => {
@@ -37,6 +38,8 @@ describe("queue Worker", () => {
     expect(claim.jobs[0]?.id).toBe(first.job.id);
     const leaseToken = claim.jobs[0]?.lease?.token;
     expect(leaseToken).toBeTypeOf("string");
+
+    if (!leaseToken) throw new Error("claim returned a job without a lease token");
 
     const wrongCompletion = await post(`/queues/integration/jobs/${first.job.id}/complete`, {
       leaseToken: "wrong-token",
@@ -84,11 +87,32 @@ describe("queue Worker", () => {
     expect(second.jobs).toHaveLength(1);
     expect(first.jobs[0]?.id).not.toBe(second.jobs[0]?.id);
   });
+
+  it("validates request bodies at the JSON boundary", async () => {
+    const missingPayload = await post("/queues/validation/jobs", {});
+    expect(missingPayload.status).toBe(400);
+    await expect(missingPayload.json()).resolves.toMatchObject({
+      error: { code: "invalid_body", message: "payload is required" },
+    });
+
+    const nullPayload = await post("/queues/validation/jobs", { payload: null });
+    expect(nullPayload.status).toBe(201);
+
+    const invalidMaxJobs = await post("/queues/validation/claims", {
+      workerId: "worker",
+      maxJobs: null,
+    });
+
+    expect(invalidMaxJobs.status).toBe(400);
+    await expect(invalidMaxJobs.json()).resolves.toMatchObject({
+      error: { code: "invalid_body", message: "maxJobs must be an integer from 1 to 100" },
+    });
+  });
 });
 
 function post(
   path: string,
-  body: unknown,
+  body: JsonValue,
   headers: Record<string, string> = {},
 ): Promise<Response> {
   return exports.default.fetch(`https://queue.test${path}`, {
