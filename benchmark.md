@@ -16,15 +16,15 @@ A real R2 run could not start. `npx wrangler r2 bucket list` returned Cloudflare
 Please enable R2 through the Cloudflare Dashboard.
 ```
 
-No bucket was created, no Worker was deployed, and no measured remote R2 latency appears in this report.
+The run created no bucket and deployed no Worker. This report has no remote R2 latency measurements.
 
 ## Queue under test
 
-The benchmark exercised the HTTP API and the code in [`src/broker.ts`](src/broker.ts). Each named queue routes to one Durable Object. The broker batches requests, rewrites `queues/<queue>/queue.json`, and acknowledges each request after the conditional R2 `put()` succeeds.
+The benchmark tested the HTTP API and the code in [`src/broker.ts`](src/broker.ts). Each named queue routes to one Durable Object. The broker batches requests and rewrites `queues/<queue>/queue.json`. It acknowledges each request after the conditional R2 `put()` succeeds.
 
 The test payload was 126 to 128 bytes of JSON. Each run used a fresh queue name. Push tests issued 400 requests at fixed concurrency. Claim and completion tests used concurrency 32. Every result below is the median of three runs.
 
-Test host and runtime:
+The tests used this host and runtime:
 
 | Item | Value |
 | --- | --- |
@@ -52,7 +52,7 @@ Wrangler request logging remained enabled. These numbers are useful for comparin
 | 32 | 789.5 ops/s | 34.00 ms | 51.73 ms | 60.88 ms | 17.39 |
 | 128 | 747.7 ops/s | 145.68 ms | 196.64 ms | 197.92 ms | 16.67 |
 
-Concurrency 32 was the best tested point. Concurrency 128 did not improve throughput and raised p50 latency by more than 4x. The broker accumulated more waiting requests without producing larger median batches.
+Concurrency 32 had the highest measured throughput. Concurrency 128 did not improve throughput and raised p50 latency by more than 4x. The broker accumulated more waiting requests without producing larger median batches.
 
 ### Claim and completion
 
@@ -93,7 +93,7 @@ Examples:
 
 This is a ceiling, not a latency measurement. Serialization time, object size, R2 `put()` latency, retries, and Durable Object load can reduce it.
 
-The current `QUEUE_BATCH_WINDOW_MS=5` setting is unsafe for remote R2. It allows the broker to begin another commit far sooner than the one-write-per-second limit. The broker also lacks a specific `429` retry path. Under steady traffic, requests can fail instead of waiting for the next legal commit.
+The current `QUEUE_BATCH_WINDOW_MS=5` setting is unsafe for remote R2. It lets the broker start another commit before the one-write-per-second limit allows it. The broker also lacks a specific `429` retry path. Under steady traffic, requests can fail instead of waiting for the next allowed commit.
 
 To retain the one-file design on R2, the broker needs all of the following:
 
@@ -102,7 +102,7 @@ To retain the one-file design on R2, the broker needs all of the following:
 - enough pending-request capacity for one-second batches
 - multiple queue names when one shard cannot hold the arrival rate
 
-The 1-second commit cadence adds batching delay. With steady arrivals, the scheduling delay alone averages about 500 ms and approaches 1 second at the tail, before the R2 write time. Remote R2 latency remains unmeasured.
+Committing once per second adds batching delay. With steady arrivals, the scheduling delay alone averages about 500 ms. The longest delays approach 1 second, before the R2 write time. Remote R2 latency remains unmeasured.
 
 ## S3 comparison
 
@@ -115,11 +115,17 @@ The local napkin-math checkout is `sirupsen/napkin-math` at commit [`aae5832`](h
 | LIST | 100 ms | Not given |
 | Single-connection PUT | 200 ms | 100 MiB/s |
 
-The same repository reports a March 2026 S3 measurement of about 95 MiB/s for a same-region 1 GiB single-stream GET, 2.0 GiB/s for concurrent range GETs, and 1.8 to 1.9 GiB/s for multipart PUTs. Those large-object throughput measurements do not predict this queue's small conditional overwrite latency. The repository calls its small-object latency figures rough heuristics. See the [object-storage numbers and provenance](https://github.com/sirupsen/napkin-math/blob/aae5832fc5d7c6881b7a78f756e8863ec86c428b/README.md#numbers).
+The same repository reports March 2026 S3 measurements:
 
-AWS publishes a broader range. Its S3 performance guide says small-object latency is roughly [100 to 200 ms](https://docs.aws.amazon.com/AmazonS3/latest/userguide/optimizing-performance.html). It also states that one prefix supports at least 3,500 write requests/s and 5,500 read requests/s after scaling. That prefix limit does not make this queue commit 3,500 times/s. A CAS broker must serialize updates to one key, so the 100 to 200 ms request latency implies roughly 5 to 10 sequential commits/s before application overhead. The 200 ms napkin figure gives the more conservative estimate of 5 commits/s.
+- about 95 MiB/s for a same-region 1 GiB single-stream GET
+- 2.0 GiB/s for concurrent range GETs
+- 1.8 to 1.9 GiB/s for multipart PUTs
 
-S3 now supports `If-Match` on `PutObject`, so the R2 CAS algorithm has a direct S3 equivalent. S3 also provides strong read-after-write consistency for object overwrites. See AWS's [conditional write](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html) and [consistency](https://docs.aws.amazon.com/AmazonS3/latest/userguide/Welcome.html#ConsistencyModel) documentation.
+Those large-object throughput measurements do not predict this queue's small conditional overwrite latency. The repository describes its small-object latency figures as rough estimates. See the [object-storage numbers and provenance](https://github.com/sirupsen/napkin-math/blob/aae5832fc5d7c6881b7a78f756e8863ec86c428b/README.md#numbers).
+
+AWS's S3 performance guide gives a small-object latency range of roughly [100 to 200 ms](https://docs.aws.amazon.com/AmazonS3/latest/userguide/optimizing-performance.html). It also states that one prefix supports at least 3,500 write requests/s and 5,500 read requests/s after scaling. That prefix limit does not make this queue commit 3,500 times/s. A compare-and-set broker must update one key sequentially. At 100 to 200 ms per request, that means roughly 5 to 10 commits/s before application overhead. The 200 ms napkin estimate gives the more conservative rate of 5 commits/s.
+
+S3 supports `If-Match` on `PutObject`, so the R2 compare-and-set algorithm has a direct S3 equivalent. S3 also provides strong read-after-write consistency for object overwrites. See AWS's [conditional write](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html) and [consistency](https://docs.aws.amazon.com/AmazonS3/latest/userguide/Welcome.html#ConsistencyModel) documentation.
 
 ### Estimated queue behavior
 
@@ -134,11 +140,11 @@ S3 now supports `If-Match` on `PutObject`, so the R2 CAS algorithm has a direct 
 | Job rate with 1,000 jobs per commit | At most 1,000 jobs/s | About 5,000 jobs/s |
 | Main scaling method | More queue keys | More queue keys and prefixes |
 
-The S3 row is an estimate, not a benchmark of this TypeScript service. A fair live comparison would place the S3 broker on EC2 in the bucket's region and the R2 broker in a deployed Worker. Running both clients from this Mac would mostly measure internet distance.
+The S3 figures are estimates, not measurements of this TypeScript service. A fair live comparison would place the S3 broker on EC2 in the bucket's region and the R2 broker in a deployed Worker. Running both clients from this Mac would mostly measure internet latency.
 
 ## Request cost
 
-The hot broker caches the last queue snapshot, so the steady-state object-storage cost is one write per group commit. Cold starts add a read. The table below prices only object-storage requests for 1 million jobs and ignores free tiers, Worker or EC2 compute, Durable Object requests, logging, and failed retries.
+The broker caches the last queue snapshot, so each group commit needs one object-storage write while the broker is running. Cold starts add a read. The table below prices only object-storage requests for 1 million jobs. It excludes free tiers, Worker or EC2 compute, Durable Object requests, logging, and failed retries.
 
 R2 Standard charges $4.50 per million Class A operations. S3 Standard PUT requests are commonly priced at $0.005 per 1,000 requests in US regions, which is $5 per million. Confirm the chosen AWS region on the [S3 pricing page](https://aws.amazon.com/s3/pricing/). Current R2 prices and its free tier are on the [R2 pricing page](https://developers.cloudflare.com/r2/pricing/).
 
@@ -162,19 +168,19 @@ The queue rewrites old jobs on every commit. To grow an empty queue to 10,000 pe
 | 100 jobs | 100 | 117.6 MiB | 12.3 KiB |
 | 1,000 jobs | 10 | 12.8 MiB | 1.3 KiB |
 
-Larger batches improve request cost and rewrite amplification. On R2 they also raise the only useful throughput lever available to a single key. The tradeoff is more waiting time and more requests lost together if a commit fails.
+Larger batches lower request cost and the bytes rewritten per job. On R2, batching is the only way to raise job throughput for a single key. Jobs wait longer, though, and a failed commit rejects more requests at once.
 
 ## Decision
 
 Do not deploy the current 5 ms commit loop against R2 unchanged.
 
-For a low-rate notification queue, keep the one-file design and pace commits at one per second. Make `429` retryable and use a one-second batch. For higher rates, shard across queue files. If strict global FIFO across all jobs matters more than the one-file constraint, R2 is the wrong hot coordination store for this implementation. Durable Object SQLite or Cloudflare Queues can hold the live queue while R2 stores snapshots or an append-only audit log.
+For a low-rate notification queue, keep the one-file design and pace commits at one per second. Retry `429` responses and use a one-second batch. For higher rates, split jobs across queue files. If strict global FIFO across all jobs matters more than the one-file constraint, do not use R2 to coordinate the live queue. Use Durable Object SQLite or Cloudflare Queues instead, with R2 for snapshots or an append-only audit log.
 
 The broker now paces commits with `QUEUE_COMMIT_INTERVAL_MS=1000` and retries R2 429/transient errors with jittered backoff; the remote matrix remains unmeasured.
 
 ## Remote benchmark still needed
 
-After R2 is enabled on the Cloudflare account, run a separate remote matrix with fresh queue names:
+After you enable R2 on the Cloudflare account, run these remote tests with fresh queue names:
 
 1. Deploy the Worker and bind a real `turbo-queues` bucket.
 2. Test the current 5 ms loop to record the first `429` threshold and error behavior.
