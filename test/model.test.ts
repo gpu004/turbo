@@ -40,6 +40,7 @@ describe("queue model", () => {
         now: afterExpiry,
       },
     ]);
+
     expect(oldCompletion.results[0]).toMatchObject({ ok: false, code: "lease_mismatch" });
     expect(oldCompletion.file.jobs).toHaveLength(2);
   });
@@ -48,6 +49,7 @@ describe("queue model", () => {
     const queued = applyBatch(emptyQueue("indexing", NOW), [push("job-1")]).file;
     const leased = applyBatch(queued, [claim("worker-a", ["lease-a"], NOW)]).file;
     const heartbeatAt = "2026-08-31T12:00:30.000Z";
+
     const heartbeat = applyBatch(leased, [
       {
         kind: "heartbeat",
@@ -57,6 +59,7 @@ describe("queue model", () => {
         now: heartbeatAt,
       },
     ]);
+
     expect(heartbeat.results[0]).toMatchObject({
       ok: true,
       kind: "heartbeat",
@@ -71,6 +74,7 @@ describe("queue model", () => {
         now: heartbeatAt,
       },
     ]);
+
     expect(completed.file.jobs).toEqual([]);
     expect(completed.results[0]).toMatchObject({
       ok: true,

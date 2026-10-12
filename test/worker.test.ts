@@ -10,6 +10,7 @@ describe("queue Worker", () => {
       },
       { "idempotency-key": "wal-1" },
     );
+
     expect(firstPush.status).toBe(201);
     const first = await firstPush.json<PushResponse>();
 
@@ -20,6 +21,7 @@ describe("queue Worker", () => {
       },
       { "idempotency-key": "wal-1" },
     );
+
     expect(duplicatePush.status).toBe(200);
     const duplicate = await duplicatePush.json<PushResponse>();
     expect(duplicate.duplicate).toBe(true);
@@ -29,6 +31,7 @@ describe("queue Worker", () => {
       workerId: "indexer-1",
       maxJobs: 1,
     });
+
     const claim = await claimResponse.json<ClaimResponse>();
     expect(claim.jobs).toHaveLength(1);
     expect(claim.jobs[0]?.id).toBe(first.job.id);
@@ -38,16 +41,19 @@ describe("queue Worker", () => {
     const wrongCompletion = await post(`/queues/integration/jobs/${first.job.id}/complete`, {
       leaseToken: "wrong-token",
     });
+
     expect(wrongCompletion.status).toBe(409);
 
     const heartbeat = await post(`/queues/integration/jobs/${first.job.id}/heartbeat`, {
       leaseToken,
     });
+
     expect(heartbeat.status).toBe(200);
 
     const completion = await post(`/queues/integration/jobs/${first.job.id}/complete`, {
       leaseToken,
     });
+
     expect(completion.status).toBe(200);
 
     const stateResponse = await exports.default.fetch("https://queue.test/queues/integration");
@@ -71,6 +77,7 @@ describe("queue Worker", () => {
       post("/queues/concurrent/claims", { workerId: "a" }),
       post("/queues/concurrent/claims", { workerId: "b" }),
     ]);
+
     const first = await one.json<ClaimResponse>();
     const second = await two.json<ClaimResponse>();
     expect(first.jobs).toHaveLength(1);

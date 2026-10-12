@@ -111,6 +111,7 @@ export function applyBatch(source: QueueFile, mutations: QueueMutation[]): Batch
         const existing = mutation.idempotencyKey
           ? file.jobs.find((job) => job.idempotencyKey === mutation.idempotencyKey)
           : undefined;
+
         if (existing) {
           results.push({ ok: true, kind: "push", job: existing, duplicate: true });
           break;
@@ -124,6 +125,7 @@ export function applyBatch(source: QueueFile, mutations: QueueMutation[]): Batch
           state: "pending",
           ...(mutation.idempotencyKey ? { idempotencyKey: mutation.idempotencyKey } : {}),
         };
+
         file.jobs.push(job);
         results.push({ ok: true, kind: "push", job, duplicate: false });
         changed = true;
@@ -136,12 +138,15 @@ export function applyBatch(source: QueueFile, mutations: QueueMutation[]): Batch
 
         for (const job of file.jobs) {
           if (claimed.length >= mutation.maxJobs) break;
+
           const ready =
             job.state === "pending" ||
             (job.lease !== undefined && Date.parse(job.lease.expiresAt) <= nowMs);
+
           if (!ready) continue;
 
           const token = mutation.leaseTokens[claimed.length];
+
           if (!token) throw new Error("claim mutation does not contain enough lease tokens");
           job.state = "leased";
           job.attempts += 1;
@@ -161,6 +166,7 @@ export function applyBatch(source: QueueFile, mutations: QueueMutation[]): Batch
 
       case "heartbeat": {
         const result = validateLease(file, mutation.jobId, mutation.leaseToken, mutation.now);
+
         if (!result.ok) {
           results.push({ ...result, kind: "heartbeat" });
           break;
@@ -183,6 +189,7 @@ export function applyBatch(source: QueueFile, mutations: QueueMutation[]): Batch
 
       case "complete": {
         const jobIndex = file.jobs.findIndex((job) => job.id === mutation.jobId);
+
         if (jobIndex === -1) {
           results.push({
             ok: true,
@@ -194,6 +201,7 @@ export function applyBatch(source: QueueFile, mutations: QueueMutation[]): Batch
         }
 
         const result = validateLease(file, mutation.jobId, mutation.leaseToken, mutation.now);
+
         if (!result.ok) {
           results.push({ ...result, kind: "complete" });
           break;
@@ -233,15 +241,19 @@ function validateLease(
       message: string;
     } {
   const job = file.jobs.find((candidate) => candidate.id === jobId);
+
   if (!job || job.state !== "leased" || !job.lease) {
     return { ok: false, code: "job_not_found", message: "job is not leased" };
   }
+
   if (job.lease.token !== leaseToken) {
     return { ok: false, code: "lease_mismatch", message: "lease token does not own this job" };
   }
+
   if (Date.parse(job.lease.expiresAt) <= Date.parse(now)) {
     return { ok: false, code: "lease_expired", message: "job lease has expired" };
   }
+
   return { ok: true, job: job as QueueJob & { lease: Lease } };
 }
 
@@ -249,6 +261,7 @@ export function assertQueueFile(value: unknown, expectedQueue: string): asserts 
   if (!isRecord(value) || value.version !== 1 || value.queue !== expectedQueue) {
     throw new Error(`R2 object for queue ${expectedQueue} has an incompatible format`);
   }
+
   if (!Array.isArray(value.jobs) || typeof value.revision !== "number") {
     throw new Error(`R2 object for queue ${expectedQueue} is malformed`);
   }
