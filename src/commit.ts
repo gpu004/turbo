@@ -54,20 +54,31 @@ export class CommitPacer {
     private readonly sleep: (ms: number) => Promise<void>,
   ) {}
 
+  waitReady(): Promise<void> {
+    const ready = this.pendingTurn.then(() => this.waitUntilReady());
+
+    this.pendingTurn = ready.catch(() => {});
+
+    return ready;
+  }
+
   waitTurn(): Promise<void> {
     const turn = this.pendingTurn.then(async () => {
-      if (this.lastStartAt !== undefined) {
-        const waitMs = this.intervalMs - (this.now() - this.lastStartAt);
-
-        if (waitMs > 0) await this.sleep(waitMs);
-      }
-
+      await this.waitUntilReady();
       this.lastStartAt = this.now();
     });
 
     this.pendingTurn = turn.catch(() => {});
 
     return turn;
+  }
+
+  private async waitUntilReady(): Promise<void> {
+    if (this.lastStartAt === undefined) return;
+
+    const waitMs = this.intervalMs - (this.now() - this.lastStartAt);
+
+    if (waitMs > 0) await this.sleep(waitMs);
   }
 }
 

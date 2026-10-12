@@ -193,6 +193,7 @@ export class QueueBroker extends DurableObject<Env> {
     await delay(this.integerSetting("QUEUE_BATCH_WINDOW_MS", 5, 0, 1_000));
 
     while (this.pending.length > 0) {
+      await this.pacer.waitReady();
       const batch = this.pending.splice(0);
 
       try {

@@ -140,6 +140,33 @@ describe("queue commit retries", () => {
     expect(starts).toEqual([0, 1_000, 2_000]);
   });
 
+  it("waitReady does not advance the next turn before the first put", async () => {
+    const clock = new FakeClock();
+    const pacer = new CommitPacer(1_000, clock.now, clock.sleep);
+
+    await pacer.waitReady();
+    await pacer.waitTurn();
+
+    expect(clock.time).toBe(0);
+    expect(clock.sleeps).toEqual([]);
+  });
+
+  it("waitReady waits for the remaining interval without claiming the turn", async () => {
+    const clock = new FakeClock();
+    const pacer = new CommitPacer(1_000, clock.now, clock.sleep);
+
+    await pacer.waitTurn();
+    clock.time = 300;
+    await pacer.waitReady();
+
+    expect(clock.time).toBe(1_000);
+    expect(clock.sleeps).toEqual([700]);
+
+    await pacer.waitTurn();
+
+    expect(clock.sleeps).toEqual([700]);
+  });
+
   it("classifies retryable R2 errors and bounds full-jitter backoff", () => {
     const cases: Array<{ code: string; retryable: boolean }> = [
       { code: "10058", retryable: true },
