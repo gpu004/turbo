@@ -23,6 +23,14 @@ export interface QueueJob {
   lease?: Lease;
 }
 
+export interface CompletedJob {
+  jobId: string;
+  leaseToken: string;
+  idempotencyKey?: string;
+  completedAt: string;
+  expiresAt: string;
+}
+
 export interface QueueFile {
   version: 1;
   queue: string;
@@ -33,7 +41,17 @@ export interface QueueFile {
   revision: number;
   updatedAt: string;
   jobs: QueueJob[];
+  completed: CompletedJob[];
 }
+
+export type PublicJob = Omit<QueueJob, "lease"> & {
+  lease?: Omit<Lease, "token">;
+};
+
+export type PublicQueueFile = Omit<QueueFile, "jobs" | "completed"> & {
+  jobs: PublicJob[];
+  completed: Array<Omit<CompletedJob, "leaseToken">>;
+};
 
 export type QueueMutation =
   | {
@@ -63,10 +81,24 @@ export type QueueMutation =
       jobId: string;
       leaseToken: string;
       now: string;
+      retainSeconds: number;
     };
 
 export type MutationResult =
-  | { ok: true; kind: "push"; job: QueueJob; duplicate: boolean }
+  | { ok: true; kind: "push"; job: PublicJob; duplicate: boolean }
+  | {
+      ok: true;
+      kind: "push";
+      duplicate: true;
+      jobId: string;
+      completedAt: string;
+    }
+  | {
+      ok: false;
+      kind: "push";
+      code: "queue_full";
+      message: string;
+    }
   | { ok: true; kind: "claim"; jobs: QueueJob[] }
   | { ok: true; kind: "heartbeat"; job: QueueJob }
   | { ok: true; kind: "complete"; jobId: string; alreadyCompleted: boolean }
@@ -97,22 +129,61 @@ export function emptyQueue(queue: string, now: string): QueueFile {
     revision: 0,
     updatedAt: now,
     jobs: [],
+    completed: [],
   };
 }
 
-export function applyBatch(source: QueueFile, mutations: QueueMutation[]): BatchResult {
+export function applyBatch(
+  source: QueueFile,
+  mutations: QueueMutation[],
+  rejectPushes: ReadonlySet<number> = new Set(),
+): BatchResult {
   const file = structuredClone(source);
   const results: MutationResult[] = [];
   let changed = false;
 
-  for (const mutation of mutations) {
+  const batchNow = mutations.at(-1)?.now;
+  if (batchNow) {
+    const nowMs = Date.parse(batchNow);
+    file.completed = file.completed.filter((job) => Date.parse(job.expiresAt) > nowMs);
+  }
+
+  for (const [index, mutation] of mutations.entries()) {
     switch (mutation.kind) {
       case "push": {
+        if (rejectPushes.has(index)) {
+          results.push({
+            ok: false,
+            kind: "push",
+            code: "queue_full",
+            message: "queue exceeds configured MAX_QUEUE_BYTES",
+          });
+          break;
+        }
+
         const existing = mutation.idempotencyKey
           ? file.jobs.find((job) => job.idempotencyKey === mutation.idempotencyKey)
           : undefined;
         if (existing) {
-          results.push({ ok: true, kind: "push", job: existing, duplicate: true });
+          results.push({ ok: true, kind: "push", job: publicJob(existing), duplicate: true });
+          break;
+        }
+
+        const completed = mutation.idempotencyKey
+          ? file.completed.find(
+              (job) =>
+                job.idempotencyKey === mutation.idempotencyKey &&
+                Date.parse(job.expiresAt) > Date.parse(mutation.now),
+            )
+          : undefined;
+        if (completed) {
+          results.push({
+            ok: true,
+            kind: "push",
+            duplicate: true,
+            jobId: completed.jobId,
+            completedAt: completed.completedAt,
+          });
           break;
         }
 
@@ -125,7 +196,7 @@ export function applyBatch(source: QueueFile, mutations: QueueMutation[]): Batch
           ...(mutation.idempotencyKey ? { idempotencyKey: mutation.idempotencyKey } : {}),
         };
         file.jobs.push(job);
-        results.push({ ok: true, kind: "push", job, duplicate: false });
+        results.push({ ok: true, kind: "push", job: publicJob(job), duplicate: false });
         changed = true;
         break;
       }
@@ -184,11 +255,30 @@ export function applyBatch(source: QueueFile, mutations: QueueMutation[]): Batch
       case "complete": {
         const jobIndex = file.jobs.findIndex((job) => job.id === mutation.jobId);
         if (jobIndex === -1) {
+          const completed = file.completed.find((job) => job.jobId === mutation.jobId);
+          if (completed?.leaseToken === mutation.leaseToken) {
+            results.push({
+              ok: true,
+              kind: "complete",
+              jobId: mutation.jobId,
+              alreadyCompleted: true,
+            });
+            break;
+          }
+          if (completed) {
+            results.push({
+              ok: false,
+              kind: "complete",
+              code: "lease_mismatch",
+              message: "lease token does not own this job",
+            });
+            break;
+          }
           results.push({
-            ok: true,
+            ok: false,
             kind: "complete",
-            jobId: mutation.jobId,
-            alreadyCompleted: true,
+            code: "job_not_found",
+            message: "job does not exist",
           });
           break;
         }
@@ -199,6 +289,15 @@ export function applyBatch(source: QueueFile, mutations: QueueMutation[]): Batch
           break;
         }
 
+        file.completed.push({
+          jobId: result.job.id,
+          leaseToken: mutation.leaseToken,
+          ...(result.job.idempotencyKey ? { idempotencyKey: result.job.idempotencyKey } : {}),
+          completedAt: mutation.now,
+          expiresAt: new Date(
+            Date.parse(mutation.now) + mutation.retainSeconds * 1_000,
+          ).toISOString(),
+        });
         file.jobs.splice(jobIndex, 1);
         results.push({
           ok: true,
@@ -218,6 +317,32 @@ export function applyBatch(source: QueueFile, mutations: QueueMutation[]): Batch
   }
 
   return { file, results, changed };
+}
+
+export function publicJob(job: QueueJob): PublicJob {
+  if (!job.lease) return { ...job };
+
+  return {
+    ...job,
+    lease: {
+      workerId: job.lease.workerId,
+      heartbeatAt: job.lease.heartbeatAt,
+      expiresAt: job.lease.expiresAt,
+    },
+  };
+}
+
+export function publicQueueFile(file: QueueFile): PublicQueueFile {
+  return {
+    ...file,
+    jobs: file.jobs.map(publicJob),
+    completed: file.completed.map((job) => ({
+      jobId: job.jobId,
+      ...(job.idempotencyKey ? { idempotencyKey: job.idempotencyKey } : {}),
+      completedAt: job.completedAt,
+      expiresAt: job.expiresAt,
+    })),
+  };
 }
 
 function validateLease(
@@ -249,9 +374,18 @@ export function assertQueueFile(value: unknown, expectedQueue: string): asserts 
   if (!isRecord(value) || value.version !== 1 || value.queue !== expectedQueue) {
     throw new Error(`R2 object for queue ${expectedQueue} has an incompatible format`);
   }
-  if (!Array.isArray(value.jobs) || typeof value.revision !== "number") {
+  if (
+    !Array.isArray(value.jobs) ||
+    typeof value.revision !== "number" ||
+    ("completed" in value && !Array.isArray(value.completed))
+  ) {
     throw new Error(`R2 object for queue ${expectedQueue} is malformed`);
   }
+}
+
+export function normalizeQueueFile(value: unknown, expectedQueue: string): QueueFile {
+  assertQueueFile(value, expectedQueue);
+  return { ...value, completed: value.completed ?? [] };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

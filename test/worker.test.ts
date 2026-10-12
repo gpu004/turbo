@@ -12,6 +12,8 @@ describe("queue Worker", () => {
     );
     expect(firstPush.status).toBe(201);
     const first = await firstPush.json<PushResponse>();
+    const firstJobId = first.job?.id;
+    expect(firstJobId).toBeTypeOf("string");
 
     const duplicatePush = await post(
       "/queues/integration/jobs",
@@ -23,7 +25,7 @@ describe("queue Worker", () => {
     expect(duplicatePush.status).toBe(200);
     const duplicate = await duplicatePush.json<PushResponse>();
     expect(duplicate.duplicate).toBe(true);
-    expect(duplicate.job.id).toBe(first.job.id);
+    expect(duplicate.job?.id).toBe(firstJobId);
 
     const claimResponse = await post("/queues/integration/claims", {
       workerId: "indexer-1",
@@ -31,21 +33,25 @@ describe("queue Worker", () => {
     });
     const claim = await claimResponse.json<ClaimResponse>();
     expect(claim.jobs).toHaveLength(1);
-    expect(claim.jobs[0]?.id).toBe(first.job.id);
+    expect(claim.jobs[0]?.id).toBe(firstJobId);
     const leaseToken = claim.jobs[0]?.lease?.token;
     expect(leaseToken).toBeTypeOf("string");
 
-    const wrongCompletion = await post(`/queues/integration/jobs/${first.job.id}/complete`, {
+    const inspectResponse = await exports.default.fetch("https://queue.test/queues/integration");
+    const inspected = await inspectResponse.json<{ jobs: Array<{ lease?: { token?: string } }> }>();
+    expect(inspected.jobs[0]?.lease).not.toHaveProperty("token");
+
+    const wrongCompletion = await post(`/queues/integration/jobs/${firstJobId}/complete`, {
       leaseToken: "wrong-token",
     });
     expect(wrongCompletion.status).toBe(409);
 
-    const heartbeat = await post(`/queues/integration/jobs/${first.job.id}/heartbeat`, {
+    const heartbeat = await post(`/queues/integration/jobs/${firstJobId}/heartbeat`, {
       leaseToken,
     });
     expect(heartbeat.status).toBe(200);
 
-    const completion = await post(`/queues/integration/jobs/${first.job.id}/complete`, {
+    const completion = await post(`/queues/integration/jobs/${firstJobId}/complete`, {
       leaseToken,
     });
     expect(completion.status).toBe(200);
@@ -54,6 +60,79 @@ describe("queue Worker", () => {
     const state = await stateResponse.json<{ jobs: unknown[]; revision: number }>();
     expect(state.jobs).toEqual([]);
     expect(state.revision).toBeGreaterThanOrEqual(4);
+  });
+
+  it("deduplicates completed jobs and rejects unknown completions", async () => {
+    const initial = await post(
+      "/queues/completed/jobs",
+      { payload: { value: 1 } },
+      { "idempotency-key": "key-1" },
+    );
+    const first = await initial.json<PushResponse>();
+    const jobId = first.job?.id;
+    expect(jobId).toBeTypeOf("string");
+
+    const claimResponse = await post("/queues/completed/claims", { workerId: "worker" });
+    const claim = await claimResponse.json<ClaimResponse>();
+    const leaseToken = claim.jobs[0]?.lease?.token;
+    await post(`/queues/completed/jobs/${jobId}/complete`, { leaseToken });
+
+    const duplicateResponse = await post(
+      "/queues/completed/jobs",
+      { payload: { value: 1 } },
+      { "idempotency-key": "key-1" },
+    );
+    expect(duplicateResponse.status).toBe(200);
+    expect(await duplicateResponse.json()).toMatchObject({
+      ok: true,
+      kind: "push",
+      duplicate: true,
+      jobId,
+    });
+
+    const unknown = await post("/queues/completed/jobs/never-existed/complete", {
+      leaseToken: "any-token",
+    });
+    expect(unknown.status).toBe(404);
+    expect(await unknown.json()).toMatchObject({
+      error: { code: "job_not_found" },
+    });
+
+    const stateResponse = await exports.default.fetch("https://queue.test/queues/completed");
+    const state = await stateResponse.json<{ jobs: unknown[] }>();
+    expect(state.jobs).toEqual([]);
+  });
+
+  it("redacts lease tokens from inspected queues and duplicate leased pushes", async () => {
+    const initial = await post(
+      "/queues/redacted/jobs",
+      { payload: { value: 1 } },
+      { "idempotency-key": "key-1" },
+    );
+    const first = await initial.json<PushResponse>();
+    const jobId = first.job?.id;
+
+    const claimResponse = await post("/queues/redacted/claims", { workerId: "worker" });
+    const claim = await claimResponse.json<ClaimResponse>();
+    expect(claim.jobs[0]?.id).toBe(jobId);
+    expect(claim.jobs[0]?.lease?.token).toBeTypeOf("string");
+
+    const duplicateResponse = await post(
+      "/queues/redacted/jobs",
+      { payload: { value: 1 } },
+      { "idempotency-key": "key-1" },
+    );
+    expect(duplicateResponse.status).toBe(200);
+    const duplicate = await duplicateResponse.json<PushResponse>();
+    expect(duplicate.job?.id).toBe(jobId);
+    expect(duplicate.job).not.toHaveProperty("lease.token");
+
+    const inspectResponse = await exports.default.fetch("https://queue.test/queues/redacted");
+    const state = await inspectResponse.json<{
+      jobs: Array<{ id: string; lease?: { token?: string } }>;
+    }>();
+    expect(state.jobs[0]?.id).toBe(jobId);
+    expect(state.jobs[0]?.lease).not.toHaveProperty("token");
   });
 
   it("claims concurrent jobs only once", async () => {
@@ -93,7 +172,8 @@ function post(
 
 interface PushResponse {
   duplicate: boolean;
-  job: { id: string };
+  job?: { id: string; lease?: { token?: string } };
+  jobId?: string;
 }
 
 interface ClaimResponse {

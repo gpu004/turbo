@@ -1,8 +1,9 @@
 import { DurableObject } from "cloudflare:workers";
 import {
   applyBatch,
-  assertQueueFile,
   emptyQueue,
+  normalizeQueueFile,
+  publicQueueFile,
   type MutationResult,
   type JsonValue,
   type QueueFile,
@@ -78,6 +79,7 @@ export class QueueBroker extends DurableObject<Env> {
       jobId,
       leaseToken,
       now: new Date().toISOString(),
+      retainSeconds: this.integerSetting("COMPLETED_RETENTION_SECONDS", 3_600, 1, 604_800),
     });
     if (result.kind !== "complete") throw new Error("broker returned the wrong mutation result");
     return JSON.stringify(result satisfies CompleteResult);
@@ -87,7 +89,7 @@ export class QueueBroker extends DurableObject<Env> {
     this.bindQueue(queue);
     if (this.flushPromise) await this.flushPromise;
     const snapshot = await this.load(queue, true);
-    return JSON.stringify(snapshot.file);
+    return JSON.stringify(publicQueueFile(snapshot.file));
   }
 
   private bindQueue(queue: string): void {
@@ -134,20 +136,44 @@ export class QueueBroker extends DurableObject<Env> {
     const queue = this.queueName;
     if (!queue) throw new Error("queue broker is not initialized");
 
+    const maxBytes = this.integerSetting(
+      "MAX_QUEUE_BYTES",
+      8 * 1024 * 1024,
+      1_024,
+      32 * 1024 * 1024,
+    );
+    const encoder = new TextEncoder();
+
     for (let attempt = 0; attempt < 5; attempt += 1) {
       const snapshot = await this.load(queue, attempt > 0);
-      const applied = applyBatch(snapshot.file, mutations);
+      const rejectPushes = new Set<number>();
+      let applied = applyBatch(snapshot.file, mutations, rejectPushes);
       if (!applied.changed) return applied.results;
 
-      const body = JSON.stringify(applied.file);
-      const maxBytes = this.integerSetting(
-        "MAX_QUEUE_BYTES",
-        8 * 1024 * 1024,
-        1_024,
-        32 * 1024 * 1024,
-      );
-      if (new TextEncoder().encode(body).byteLength > maxBytes) {
-        throw new Error(`queue exceeds configured MAX_QUEUE_BYTES of ${maxBytes}`);
+      let body = JSON.stringify(applied.file);
+      let bodyBytes = encoder.encode(body).byteLength;
+      while (bodyBytes > maxBytes) {
+        let overflow = bodyBytes - maxBytes;
+        let rejectedPush = false;
+
+        for (let index = mutations.length - 1; index >= 0 && overflow > 0; index -= 1) {
+          if (rejectPushes.has(index)) continue;
+          const result = applied.results[index];
+          if (!result?.ok || result.kind !== "push" || result.duplicate) continue;
+
+          rejectPushes.add(index);
+          rejectedPush = true;
+          overflow -= encoder.encode(JSON.stringify(result.job)).byteLength + 1;
+        }
+
+        if (!rejectedPush) {
+          throw new Error(`queue exceeds configured MAX_QUEUE_BYTES of ${maxBytes}`);
+        }
+
+        applied = applyBatch(snapshot.file, mutations, rejectPushes);
+        if (!applied.changed) return applied.results;
+        body = JSON.stringify(applied.file);
+        bodyBytes = encoder.encode(body).byteLength;
       }
 
       const stored = await this.env.QUEUE_BUCKET.put(this.objectKey(queue), body, {
@@ -177,8 +203,7 @@ export class QueueBroker extends DurableObject<Env> {
     }
 
     const value: unknown = await object.json();
-    assertQueueFile(value, queue);
-    const snapshot = { file: value, etag: object.etag };
+    const snapshot = { file: normalizeQueueFile(value, queue), etag: object.etag };
     this.snapshot = snapshot;
     return snapshot;
   }
@@ -188,7 +213,11 @@ export class QueueBroker extends DurableObject<Env> {
   }
 
   private integerSetting(
-    name: "QUEUE_BATCH_WINDOW_MS" | "QUEUE_LEASE_SECONDS" | "MAX_QUEUE_BYTES",
+    name:
+      | "QUEUE_BATCH_WINDOW_MS"
+      | "QUEUE_LEASE_SECONDS"
+      | "MAX_QUEUE_BYTES"
+      | "COMPLETED_RETENTION_SECONDS",
     fallback: number,
     minimum: number,
     maximum: number,
