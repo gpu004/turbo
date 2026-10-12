@@ -30,7 +30,7 @@ npm run dev
 
 Wrangler simulates both R2 and Durable Objects locally.
 
-`npm run lint` uses Oxlint. `npm run format` writes Oxfmt formatting, and `npm run format:check` verifies it without changing files. `npm run check` runs linting, formatting checks, the Wrangler dry run, and TypeScript checking.
+`npm run lint` uses Oxlint with the vendored anti-slop plugin at `tools/oxlint/anti-slop` (see `tools/oxlint/anti-slop/UPSTREAM.md`). `npm run format` writes Oxfmt formatting, and `npm run format:check` verifies it without changing files. `npm run check` runs linting, formatting checks, the Wrangler dry run, and TypeScript checking.
 
 ## API
 
