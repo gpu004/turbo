@@ -1,5 +1,6 @@
 import { exports } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
+import type { JsonValue } from "../src/model";
 
 describe("queue size limit", () => {
   it("rejects an oversized push without failing a concurrent completion", async () => {
@@ -9,12 +10,15 @@ describe("queue size limit", () => {
     const claimResponse = await post("/queues/limited/claims", { workerId: "worker" });
     const claim = await claimResponse.json<ClaimResponse>();
     const job = claim.jobs[0];
-    expect(job).toBeDefined();
+
+    if (!job) throw new Error("claim returned no job");
+
+    const leaseToken = job.lease?.token;
+
+    if (!leaseToken) throw new Error("claim returned a job without a lease token");
 
     const [completion, oversizedPush] = await Promise.all([
-      post(`/queues/limited/jobs/${job?.id}/complete`, {
-        leaseToken: job?.lease?.token,
-      }),
+      post(`/queues/limited/jobs/${job.id}/complete`, { leaseToken }),
       post("/queues/limited/jobs", { payload: "x".repeat(2_000) }),
     ]);
 
@@ -32,7 +36,7 @@ describe("queue size limit", () => {
   });
 });
 
-function post(path: string, body: unknown): Promise<Response> {
+function post(path: string, body: JsonValue): Promise<Response> {
   return exports.default.fetch(`https://queue.test${path}`, {
     method: "POST",
     headers: { "content-type": "application/json" },

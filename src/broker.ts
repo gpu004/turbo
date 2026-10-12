@@ -2,10 +2,10 @@ import { DurableObject } from "cloudflare:workers";
 import {
   applyBatch,
   emptyQueue,
-  normalizeQueueFile,
+  JsonValueSchema,
+  parseQueueFile,
   publicQueueFile,
   type MutationResult,
-  type JsonValue,
   type QueueFile,
   type QueueMutation,
 } from "./model";
@@ -18,13 +18,8 @@ interface Snapshot {
 interface PendingMutation {
   mutation: QueueMutation;
   resolve: (result: MutationResult) => void;
-  reject: (error: unknown) => void;
+  reject: (cause: unknown) => void;
 }
-
-type PushResult = Extract<MutationResult, { kind: "push" }>;
-type ClaimResult = Extract<MutationResult, { kind: "claim" }>;
-type HeartbeatResult = Extract<MutationResult, { kind: "heartbeat" }>;
-type CompleteResult = Extract<MutationResult, { kind: "complete" }>;
 
 export class QueueBroker extends DurableObject<Env> {
   private snapshot: Snapshot | undefined;
@@ -34,19 +29,25 @@ export class QueueBroker extends DurableObject<Env> {
 
   async push(queue: string, payloadJson: string, idempotencyKey?: string): Promise<string> {
     this.bindQueue(queue);
-    const result = await this.enqueue({
+
+    const mutation: Extract<QueueMutation, { kind: "push" }> = {
       kind: "push",
       id: crypto.randomUUID(),
-      payload: JSON.parse(payloadJson) as JsonValue,
-      ...(idempotencyKey ? { idempotencyKey } : {}),
+      payload: JsonValueSchema.parse(JSON.parse(payloadJson)),
       now: new Date().toISOString(),
-    });
+    };
+
+    if (idempotencyKey) mutation.idempotencyKey = idempotencyKey;
+    const result = await this.enqueue(mutation);
+
     if (result.kind !== "push") throw new Error("broker returned the wrong mutation result");
-    return JSON.stringify(result satisfies PushResult);
+
+    return JSON.stringify(result);
   }
 
   async claim(queue: string, workerId: string, maxJobs: number): Promise<string> {
     this.bindQueue(queue);
+
     const result = await this.enqueue({
       kind: "claim",
       workerId,
@@ -55,12 +56,15 @@ export class QueueBroker extends DurableObject<Env> {
       leaseSeconds: this.integerSetting("QUEUE_LEASE_SECONDS", 60, 1, 86_400),
       now: new Date().toISOString(),
     });
+
     if (result.kind !== "claim") throw new Error("broker returned the wrong mutation result");
-    return JSON.stringify(result satisfies ClaimResult);
+
+    return JSON.stringify(result);
   }
 
   async heartbeat(queue: string, jobId: string, leaseToken: string): Promise<string> {
     this.bindQueue(queue);
+
     const result = await this.enqueue({
       kind: "heartbeat",
       jobId,
@@ -68,12 +72,15 @@ export class QueueBroker extends DurableObject<Env> {
       leaseSeconds: this.integerSetting("QUEUE_LEASE_SECONDS", 60, 1, 86_400),
       now: new Date().toISOString(),
     });
+
     if (result.kind !== "heartbeat") throw new Error("broker returned the wrong mutation result");
-    return JSON.stringify(result satisfies HeartbeatResult);
+
+    return JSON.stringify(result);
   }
 
   async complete(queue: string, jobId: string, leaseToken: string): Promise<string> {
     this.bindQueue(queue);
+
     const result = await this.enqueue({
       kind: "complete",
       jobId,
@@ -81,14 +88,18 @@ export class QueueBroker extends DurableObject<Env> {
       now: new Date().toISOString(),
       retainSeconds: this.integerSetting("COMPLETED_RETENTION_SECONDS", 3_600, 1, 604_800),
     });
+
     if (result.kind !== "complete") throw new Error("broker returned the wrong mutation result");
-    return JSON.stringify(result satisfies CompleteResult);
+
+    return JSON.stringify(result);
   }
 
   async inspect(queue: string): Promise<string> {
     this.bindQueue(queue);
+
     if (this.flushPromise) await this.flushPromise;
     const snapshot = await this.load(queue, true);
+
     return JSON.stringify(publicQueueFile(snapshot.file));
   }
 
@@ -96,6 +107,7 @@ export class QueueBroker extends DurableObject<Env> {
     if (this.queueName && this.queueName !== queue) {
       throw new Error("Durable Object received operations for two queue names");
     }
+
     this.queueName = queue;
   }
 
@@ -119,10 +131,12 @@ export class QueueBroker extends DurableObject<Env> {
 
     while (this.pending.length > 0) {
       const batch = this.pending.splice(0);
+
       try {
         const results = await this.commit(batch.map((item) => item.mutation));
         batch.forEach((item, index) => {
           const result = results[index];
+
           if (result) item.resolve(result);
           else item.reject(new Error("broker returned an incomplete commit result"));
         });
@@ -134,6 +148,7 @@ export class QueueBroker extends DurableObject<Env> {
 
   private async commit(mutations: QueueMutation[]): Promise<MutationResult[]> {
     const queue = this.queueName;
+
     if (!queue) throw new Error("queue broker is not initialized");
 
     const maxBytes = this.integerSetting(
@@ -142,16 +157,19 @@ export class QueueBroker extends DurableObject<Env> {
       1_024,
       32 * 1024 * 1024,
     );
+
     const encoder = new TextEncoder();
 
     for (let attempt = 0; attempt < 5; attempt += 1) {
       const snapshot = await this.load(queue, attempt > 0);
       const rejectPushes = new Set<number>();
       let applied = applyBatch(snapshot.file, mutations, rejectPushes);
+
       if (!applied.changed) return applied.results;
 
       let body = JSON.stringify(applied.file);
       let bodyBytes = encoder.encode(body).byteLength;
+
       while (bodyBytes > maxBytes) {
         let overflow = bodyBytes - maxBytes;
         let rejectedPush = false;
@@ -159,6 +177,7 @@ export class QueueBroker extends DurableObject<Env> {
         for (let index = mutations.length - 1; index >= 0 && overflow > 0; index -= 1) {
           if (rejectPushes.has(index)) continue;
           const result = applied.results[index];
+
           if (!result?.ok || result.kind !== "push" || result.duplicate) continue;
 
           rejectPushes.add(index);
@@ -171,6 +190,7 @@ export class QueueBroker extends DurableObject<Env> {
         }
 
         applied = applyBatch(snapshot.file, mutations, rejectPushes);
+
         if (!applied.changed) return applied.results;
         body = JSON.stringify(applied.file);
         bodyBytes = encoder.encode(body).byteLength;
@@ -183,6 +203,7 @@ export class QueueBroker extends DurableObject<Env> {
 
       if (stored) {
         this.snapshot = { file: applied.file, etag: stored.etag };
+
         return applied.results;
       }
 
@@ -196,15 +217,17 @@ export class QueueBroker extends DurableObject<Env> {
     if (this.snapshot && !force) return this.snapshot;
 
     const object = await this.env.QUEUE_BUCKET.get(this.objectKey(queue));
+
     if (!object) {
       const snapshot = { file: emptyQueue(queue, new Date().toISOString()), etag: null };
       this.snapshot = snapshot;
+
       return snapshot;
     }
 
-    const value: unknown = await object.json();
-    const snapshot = { file: normalizeQueueFile(value, queue), etag: object.etag };
+    const snapshot = { file: parseQueueFile(await object.text(), queue), etag: object.etag };
     this.snapshot = snapshot;
+
     return snapshot;
   }
 
@@ -223,6 +246,7 @@ export class QueueBroker extends DurableObject<Env> {
     maximum: number,
   ): number {
     const parsed = Number.parseInt(this.env[name], 10);
+
     return Number.isFinite(parsed) && parsed >= minimum && parsed <= maximum ? parsed : fallback;
   }
 }

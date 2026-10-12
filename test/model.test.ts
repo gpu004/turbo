@@ -2,13 +2,36 @@ import { describe, expect, it } from "vitest";
 import {
   applyBatch,
   emptyQueue,
-  normalizeQueueFile,
+  parseQueueFile,
   publicJob,
   publicQueueFile,
   type QueueMutation,
 } from "../src/model";
 
 const NOW = "2026-08-31T12:00:00.000Z";
+
+describe("queue file parser", () => {
+  it("parses a valid queue file", () => {
+    const file = emptyQueue("q", NOW);
+
+    expect(parseQueueFile(JSON.stringify(file), "q")).toEqual(file);
+  });
+
+  it("rejects a queue file for a different queue", () => {
+    const file = emptyQueue("other", NOW);
+
+    expect(() => parseQueueFile(JSON.stringify(file), "q")).toThrow(
+      "R2 object for queue q has an incompatible format",
+    );
+  });
+
+  it("rejects invalid JSON and malformed queue files", () => {
+    expect(() => parseQueueFile("not json", "q")).toThrow("R2 object for queue q is malformed");
+    expect(() => parseQueueFile('{"version":1,"queue":"q","jobs":"x"}', "q")).toThrow(
+      "R2 object for queue q is malformed",
+    );
+  });
+});
 
 describe("queue model", () => {
   it("deduplicates pushes by idempotency key", () => {
@@ -48,6 +71,7 @@ describe("queue model", () => {
         retainSeconds: 3_600,
       },
     ]);
+
     expect(oldCompletion.results[0]).toMatchObject({ ok: false, code: "lease_mismatch" });
     expect(oldCompletion.file.jobs).toHaveLength(2);
   });
@@ -56,6 +80,7 @@ describe("queue model", () => {
     const queued = applyBatch(emptyQueue("indexing", NOW), [push("job-1")]).file;
     const leased = applyBatch(queued, [claim("worker-a", ["lease-a"], NOW)]).file;
     const heartbeatAt = "2026-08-31T12:00:30.000Z";
+
     const heartbeat = applyBatch(leased, [
       {
         kind: "heartbeat",
@@ -65,6 +90,7 @@ describe("queue model", () => {
         now: heartbeatAt,
       },
     ]);
+
     expect(heartbeat.results[0]).toMatchObject({
       ok: true,
       kind: "heartbeat",
@@ -84,6 +110,7 @@ describe("queue model", () => {
     const queued = applyBatch(emptyQueue("indexing", NOW), [push("job-1", "wal-1")]).file;
     const leased = applyBatch(queued, [claim("worker-a", ["lease-a"], NOW)]).file;
     const completed = applyBatch(leased, [complete("job-1", "lease-a", NOW)]);
+
     const duplicate = applyBatch(completed.file, [
       push("job-2", "wal-1", "2026-08-31T12:00:01.000Z"),
     ]);
@@ -103,6 +130,7 @@ describe("queue model", () => {
     const queued = applyBatch(emptyQueue("indexing", NOW), [push("job-1", "wal-1")]).file;
     const leased = applyBatch(queued, [claim("worker-a", ["lease-a"], NOW)]).file;
     const completed = applyBatch(leased, [complete("job-1", "lease-a", NOW, 1)]);
+
     const afterExpiry = applyBatch(completed.file, [
       push("job-2", "wal-1", "2026-08-31T12:00:01.000Z"),
     ]);
@@ -147,9 +175,11 @@ describe("queue model", () => {
     const queued = applyBatch(emptyQueue("indexing", NOW), [push("job-1", "wal-1")]).file;
     const leased = applyBatch(queued, [claim("worker-a", ["lease-a"], NOW)]);
     const claimResult = leased.results[0];
+
     if (!claimResult || claimResult.kind !== "claim" || !claimResult.jobs[0]) {
       throw new Error("expected claimed job");
     }
+
     const publicClaim = publicJob(claimResult.jobs[0]);
     const publicLeasedFile = publicQueueFile(leased.file);
     const completed = applyBatch(leased.file, [complete("job-1", "lease-a", NOW)]);
@@ -162,6 +192,7 @@ describe("queue model", () => {
 
   it("rejects selected pushes without discarding other mutations", () => {
     const queued = applyBatch(emptyQueue("indexing", NOW), [push("job-1")]).file;
+
     const applied = applyBatch(
       queued,
       [claim("worker-a", ["lease-a"], NOW), push("job-2")],
@@ -182,7 +213,7 @@ describe("queue model", () => {
     expect(applied.file.jobs[0]?.state).toBe("leased");
   });
 
-  it("normalizes legacy queue files without completed tombstones", () => {
+  it("parses legacy queue files without completed tombstones", () => {
     const legacy = {
       version: 1,
       queue: "indexing",
@@ -192,18 +223,21 @@ describe("queue model", () => {
       jobs: [],
     };
 
-    expect(normalizeQueueFile(legacy, "indexing").completed).toEqual([]);
+    expect(parseQueueFile(JSON.stringify(legacy), "indexing").completed).toEqual([]);
   });
 });
 
 function push(id: string, idempotencyKey?: string, now = NOW): QueueMutation {
-  return {
+  const mutation: Extract<QueueMutation, { kind: "push" }> = {
     kind: "push",
     id,
     payload: { id },
-    ...(idempotencyKey ? { idempotencyKey } : {}),
     now,
   };
+
+  if (idempotencyKey) mutation.idempotencyKey = idempotencyKey;
+
+  return mutation;
 }
 
 function complete(
