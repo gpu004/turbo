@@ -5,6 +5,7 @@ import {
   HeartbeatResultSchema,
   JsonValueSchema,
   PushResultSchema,
+  type BrokerFailure,
   type MutationResult,
 } from "./model";
 import { z } from "zod";
@@ -124,6 +125,8 @@ async function route(request: Request, env: Env): Promise<Response> {
       JSON.parse(await broker.push(queue, JSON.stringify(input.payload), idempotencyKey)),
     );
 
+    if (result.kind === "unavailable") return unavailableResponse(result);
+
     if (!result.ok) {
       return json({ error: { code: result.code, message: result.message } }, 507);
     }
@@ -137,6 +140,8 @@ async function route(request: Request, env: Env): Promise<Response> {
     const result = ClaimResultSchema.parse(
       JSON.parse(await broker.claim(queue, input.workerId, input.maxJobs)),
     );
+
+    if (result.kind === "unavailable") return unavailableResponse(result);
 
     return json(result);
   }
@@ -167,11 +172,24 @@ async function route(request: Request, env: Env): Promise<Response> {
   throw new HttpError(404, "not_found", "route not found");
 }
 
-function mutationResponse(result: MutationResult): Response {
+function mutationResponse(result: MutationResult | BrokerFailure): Response {
+  if (result.kind === "unavailable") return unavailableResponse(result);
+
   if (result.ok) return json(result);
   const status = result.code === "job_not_found" ? 404 : 409;
 
   return json({ error: { code: result.code, message: result.message } }, status);
+}
+
+function unavailableResponse(result: BrokerFailure): Response {
+  return new Response(JSON.stringify({ error: { code: result.code, message: result.message } }), {
+    status: 503,
+    headers: {
+      "cache-control": "no-store",
+      "content-type": "application/json; charset=utf-8",
+      "retry-after": String(result.retryAfterSeconds),
+    },
+  });
 }
 
 async function readJson<T>(request: Request, env: Env, schema: z.ZodType<T>): Promise<T> {

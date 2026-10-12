@@ -1,10 +1,11 @@
 import { DurableObject } from "cloudflare:workers";
+import { CommitPacer, StorageUnavailableError, commitBatch, type CommitDeps } from "./commit";
 import {
-  applyBatch,
   emptyQueue,
   JsonValueSchema,
   parseQueueFile,
   publicQueueFile,
+  type BrokerFailure,
   type MutationResult,
   type QueueFile,
   type QueueMutation,
@@ -17,7 +18,7 @@ interface Snapshot {
 
 interface PendingMutation {
   mutation: QueueMutation;
-  resolve: (result: MutationResult) => void;
+  resolve: (result: MutationResult | BrokerFailure) => void;
   reject: (cause: unknown) => void;
 }
 
@@ -26,6 +27,50 @@ export class QueueBroker extends DurableObject<Env> {
   private queueName: string | undefined;
   private pending: PendingMutation[] = [];
   private flushPromise: Promise<void> | undefined;
+  private readonly pacer: CommitPacer;
+  private readonly commitDeps: CommitDeps;
+  private readonly maxPendingMutations: number;
+  private readonly retryAfterSeconds: number;
+
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, env);
+
+    const commitIntervalMs = this.integerSetting("QUEUE_COMMIT_INTERVAL_MS", 1_000, 0, 60_000);
+    this.maxPendingMutations = this.integerSetting("MAX_PENDING_MUTATIONS", 10_000, 1, 1_000_000);
+    this.retryAfterSeconds = Math.max(1, Math.ceil(commitIntervalMs / 1_000));
+    this.pacer = new CommitPacer(commitIntervalMs, () => performance.now(), delay);
+    this.commitDeps = {
+      store: {
+        load: async (force) => {
+          const queue = this.queueName;
+
+          if (!queue) throw new Error("queue broker is not initialized");
+
+          return this.load(queue, force);
+        },
+        put: async (body, etag) => {
+          const queue = this.queueName;
+
+          if (!queue) throw new Error("queue broker is not initialized");
+
+          const stored = await this.env.QUEUE_BUCKET.put(this.objectKey(queue), body, {
+            onlyIf: etag ? { etagMatches: etag } : { etagDoesNotMatch: "*" },
+            httpMetadata: { contentType: "application/json" },
+          });
+
+          return stored?.etag ?? null;
+        },
+      },
+      pacer: this.pacer,
+      sleep: delay,
+      random: () => Math.random(),
+      newCommitId: () => crypto.randomUUID(),
+      maxBytes: this.integerSetting("MAX_QUEUE_BYTES", 8 * 1024 * 1024, 1_024, 32 * 1024 * 1024),
+      maxAttempts: 5,
+      backoffBaseMs: Math.max(commitIntervalMs, 50),
+      backoffCapMs: 8_000,
+    };
+  }
 
   async push(queue: string, payloadJson: string, idempotencyKey?: string): Promise<string> {
     this.bindQueue(queue);
@@ -40,7 +85,9 @@ export class QueueBroker extends DurableObject<Env> {
     if (idempotencyKey) mutation.idempotencyKey = idempotencyKey;
     const result = await this.enqueue(mutation);
 
-    if (result.kind !== "push") throw new Error("broker returned the wrong mutation result");
+    if (result.kind !== "push" && result.kind !== "unavailable") {
+      throw new Error("broker returned the wrong mutation result");
+    }
 
     return JSON.stringify(result);
   }
@@ -57,7 +104,9 @@ export class QueueBroker extends DurableObject<Env> {
       now: new Date().toISOString(),
     });
 
-    if (result.kind !== "claim") throw new Error("broker returned the wrong mutation result");
+    if (result.kind !== "claim" && result.kind !== "unavailable") {
+      throw new Error("broker returned the wrong mutation result");
+    }
 
     return JSON.stringify(result);
   }
@@ -73,7 +122,9 @@ export class QueueBroker extends DurableObject<Env> {
       now: new Date().toISOString(),
     });
 
-    if (result.kind !== "heartbeat") throw new Error("broker returned the wrong mutation result");
+    if (result.kind !== "heartbeat" && result.kind !== "unavailable") {
+      throw new Error("broker returned the wrong mutation result");
+    }
 
     return JSON.stringify(result);
   }
@@ -89,7 +140,9 @@ export class QueueBroker extends DurableObject<Env> {
       retainSeconds: this.integerSetting("COMPLETED_RETENTION_SECONDS", 3_600, 1, 604_800),
     });
 
-    if (result.kind !== "complete") throw new Error("broker returned the wrong mutation result");
+    if (result.kind !== "complete" && result.kind !== "unavailable") {
+      throw new Error("broker returned the wrong mutation result");
+    }
 
     return JSON.stringify(result);
   }
@@ -111,8 +164,18 @@ export class QueueBroker extends DurableObject<Env> {
     this.queueName = queue;
   }
 
-  private enqueue(mutation: QueueMutation): Promise<MutationResult> {
-    const result = new Promise<MutationResult>((resolve, reject) => {
+  private enqueue(mutation: QueueMutation): Promise<MutationResult | BrokerFailure> {
+    if (this.pending.length >= this.maxPendingMutations) {
+      return Promise.resolve({
+        ok: false,
+        kind: "unavailable",
+        code: "overloaded",
+        message: "queue broker has reached the pending mutation limit",
+        retryAfterSeconds: this.retryAfterSeconds,
+      });
+    }
+
+    const result = new Promise<MutationResult | BrokerFailure>((resolve, reject) => {
       this.pending.push({ mutation, resolve, reject });
     });
 
@@ -141,95 +204,33 @@ export class QueueBroker extends DurableObject<Env> {
           else item.reject(new Error("broker returned an incomplete commit result"));
         });
       } catch (error) {
-        for (const item of batch) item.reject(error);
+        if (error instanceof StorageUnavailableError) {
+          const failure: BrokerFailure = {
+            ok: false,
+            kind: "unavailable",
+            code: "storage_unavailable",
+            message: error.message,
+            retryAfterSeconds: this.retryAfterSeconds,
+          };
+
+          for (const item of batch) item.resolve(failure);
+        } else {
+          for (const item of batch) item.reject(error);
+        }
       }
     }
   }
 
   private async commit(mutations: QueueMutation[]): Promise<MutationResult[]> {
-    const queue = this.queueName;
+    try {
+      const committed = await commitBatch(mutations, this.commitDeps);
+      this.snapshot = { file: committed.file, etag: committed.etag };
 
-    if (!queue) throw new Error("queue broker is not initialized");
-
-    const maxBytes = this.integerSetting(
-      "MAX_QUEUE_BYTES",
-      8 * 1024 * 1024,
-      1_024,
-      32 * 1024 * 1024,
-    );
-
-    const encoder = new TextEncoder();
-
-    for (let attempt = 0; attempt < 5; attempt += 1) {
-      const snapshot = await this.load(queue, attempt > 0);
-      const rejectPushes = new Set<number>();
-      let evictCompleted = 0;
-      let applied = applyBatch(snapshot.file, mutations, rejectPushes, evictCompleted);
-
-      if (!applied.changed) return applied.results;
-
-      let body = JSON.stringify(applied.file);
-      let bodyBytes = encoder.encode(body).byteLength;
-
-      while (bodyBytes > maxBytes) {
-        let overflow = bodyBytes - maxBytes;
-        let rejectedPush = false;
-
-        for (let index = mutations.length - 1; index >= 0 && overflow > 0; index -= 1) {
-          if (rejectPushes.has(index)) continue;
-          const result = applied.results[index];
-
-          if (!result?.ok || result.kind !== "push" || result.duplicate) continue;
-
-          rejectPushes.add(index);
-          rejectedPush = true;
-          overflow -= encoder.encode(JSON.stringify(result.job)).byteLength + 1;
-        }
-
-        if (!rejectedPush) {
-          let evictedBytes = 0;
-          let evictedCount = 0;
-
-          const oldestCompleted = applied.file.completed.toSorted(
-            (first, second) => Date.parse(first.completedAt) - Date.parse(second.completedAt),
-          );
-
-          for (const completed of oldestCompleted) {
-            if (evictedBytes >= overflow) break;
-
-            evictedBytes += encoder.encode(JSON.stringify(completed)).byteLength + 1;
-            evictedCount += 1;
-          }
-
-          if (evictedCount === 0) {
-            throw new Error(`queue exceeds configured MAX_QUEUE_BYTES of ${maxBytes}`);
-          }
-
-          evictCompleted += evictedCount;
-        }
-
-        applied = applyBatch(snapshot.file, mutations, rejectPushes, evictCompleted);
-
-        if (!applied.changed) return applied.results;
-        body = JSON.stringify(applied.file);
-        bodyBytes = encoder.encode(body).byteLength;
-      }
-
-      const stored = await this.env.QUEUE_BUCKET.put(this.objectKey(queue), body, {
-        onlyIf: snapshot.etag ? { etagMatches: snapshot.etag } : { etagDoesNotMatch: "*" },
-        httpMetadata: { contentType: "application/json" },
-      });
-
-      if (stored) {
-        this.snapshot = { file: applied.file, etag: stored.etag };
-
-        return applied.results;
-      }
-
+      return committed.results;
+    } catch (error) {
       this.snapshot = undefined;
+      throw error;
     }
-
-    throw new Error("R2 compare-and-set failed after 5 attempts");
   }
 
   private async load(queue: string, force = false): Promise<Snapshot> {
@@ -259,7 +260,9 @@ export class QueueBroker extends DurableObject<Env> {
       | "QUEUE_BATCH_WINDOW_MS"
       | "QUEUE_LEASE_SECONDS"
       | "MAX_QUEUE_BYTES"
-      | "COMPLETED_RETENTION_SECONDS",
+      | "COMPLETED_RETENTION_SECONDS"
+      | "QUEUE_COMMIT_INTERVAL_MS"
+      | "MAX_PENDING_MUTATIONS",
     fallback: number,
     minimum: number,
     maximum: number,

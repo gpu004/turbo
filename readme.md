@@ -72,6 +72,8 @@ curl -s http://localhost:8787/queues/indexing
 
 `GET /health` does not touch R2. It only confirms that the Worker is running.
 
+The broker paces commits to at most one R2 write per second per queue by default and retries retryable R2 errors with jittered backoff. Overload and exhausted R2 retries return `503` with a `Retry-After` header.
+
 Completing a job that does not exist returns `404`; a stale or mismatched lease returns `409`. A push that cannot fit within `MAX_QUEUE_BYTES` returns `507` with code `queue_full`.
 
 ## Deploy
@@ -93,6 +95,8 @@ The defaults live in `wrangler.jsonc`:
 | --- | ---: | --- |
 | `QUEUE_BATCH_WINDOW_MS` | `5` | Time the broker waits to collect the first commit batch |
 | `QUEUE_LEASE_SECONDS` | `60` | Time before another worker may reclaim a job |
+| `QUEUE_COMMIT_INTERVAL_MS` | `1000` | Minimum delay between queue object writes |
+| `MAX_PENDING_MUTATIONS` | `10000` | Maximum queued mutations before overload responses |
 | `COMPLETED_RETENTION_SECONDS` | `3600` | How long completed jobs retain idempotency keys |
 | `MAX_QUEUE_BYTES` | `8388608` | Maximum serialized queue object size |
 | `MAX_REQUEST_BYTES` | `262144` | Maximum JSON request body size |

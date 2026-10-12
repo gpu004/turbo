@@ -84,7 +84,7 @@ describe("queue size limit", () => {
     expect(secondCompletion.status).toBe(200);
 
     const pendingPush = await post("/queues/tombstone-pressure/jobs", {
-      payload: "x".repeat(800),
+      payload: "x".repeat(750),
     });
 
     expect(pendingPush.status).toBe(201);

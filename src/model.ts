@@ -53,6 +53,7 @@ export interface QueueFile {
   };
   revision: number;
   updatedAt: string;
+  commitId?: string;
   jobs: QueueJob[];
   completed: CompletedJob[];
 }
@@ -127,6 +128,7 @@ const QueueFileSchema: z.ZodType<QueueFile> = z
       .loose(),
     revision: z.number(),
     updatedAt: z.string(),
+    commitId: z.string().exactOptional(),
     jobs: z.array(QueueJobSchema),
     completed: z.array(CompletedJobSchema).default([]),
   })
@@ -194,13 +196,31 @@ export type MutationResult =
       message: string;
     };
 
+export type BrokerFailure = {
+  ok: false;
+  kind: "unavailable";
+  code: "overloaded" | "storage_unavailable";
+  message: string;
+  retryAfterSeconds: number;
+};
+
 const MutationFailureSchema = z.object({
   ok: z.literal(false),
   code: z.enum(["job_not_found", "lease_mismatch", "lease_expired"]),
   message: z.string(),
 });
 
-export const PushResultSchema: z.ZodType<Extract<MutationResult, { kind: "push" }>> = z.union([
+export const BrokerFailureSchema: z.ZodType<BrokerFailure> = z.object({
+  ok: z.literal(false),
+  kind: z.literal("unavailable"),
+  code: z.enum(["overloaded", "storage_unavailable"]),
+  message: z.string(),
+  retryAfterSeconds: z.number(),
+});
+
+export const PushResultSchema: z.ZodType<
+  Extract<MutationResult, { kind: "push" }> | BrokerFailure
+> = z.union([
   z.object({
     ok: z.literal(true),
     kind: z.literal("push"),
@@ -220,34 +240,44 @@ export const PushResultSchema: z.ZodType<Extract<MutationResult, { kind: "push" 
     code: z.literal("queue_full"),
     message: z.string(),
   }),
+  BrokerFailureSchema,
 ]);
 
-export const ClaimResultSchema: z.ZodType<Extract<MutationResult, { kind: "claim" }>> = z.object({
-  ok: z.literal(true),
-  kind: z.literal("claim"),
-  jobs: z.array(QueueJobSchema),
-});
+export const ClaimResultSchema: z.ZodType<
+  Extract<MutationResult, { kind: "claim" }> | BrokerFailure
+> = z.union([
+  z.object({
+    ok: z.literal(true),
+    kind: z.literal("claim"),
+    jobs: z.array(QueueJobSchema),
+  }),
+  BrokerFailureSchema,
+]);
 
-export const HeartbeatResultSchema: z.ZodType<Extract<MutationResult, { kind: "heartbeat" }>> =
-  z.union([
-    z.object({
-      ok: z.literal(true),
-      kind: z.literal("heartbeat"),
-      job: QueueJobSchema,
-    }),
-    MutationFailureSchema.extend({ kind: z.literal("heartbeat") }),
-  ]);
+export const HeartbeatResultSchema: z.ZodType<
+  Extract<MutationResult, { kind: "heartbeat" }> | BrokerFailure
+> = z.union([
+  z.object({
+    ok: z.literal(true),
+    kind: z.literal("heartbeat"),
+    job: QueueJobSchema,
+  }),
+  MutationFailureSchema.extend({ kind: z.literal("heartbeat") }),
+  BrokerFailureSchema,
+]);
 
-export const CompleteResultSchema: z.ZodType<Extract<MutationResult, { kind: "complete" }>> =
-  z.union([
-    z.object({
-      ok: z.literal(true),
-      kind: z.literal("complete"),
-      jobId: z.string(),
-      alreadyCompleted: z.boolean(),
-    }),
-    MutationFailureSchema.extend({ kind: z.literal("complete") }),
-  ]);
+export const CompleteResultSchema: z.ZodType<
+  Extract<MutationResult, { kind: "complete" }> | BrokerFailure
+> = z.union([
+  z.object({
+    ok: z.literal(true),
+    kind: z.literal("complete"),
+    jobId: z.string(),
+    alreadyCompleted: z.boolean(),
+  }),
+  MutationFailureSchema.extend({ kind: z.literal("complete") }),
+  BrokerFailureSchema,
+]);
 
 export interface BatchResult {
   file: QueueFile;

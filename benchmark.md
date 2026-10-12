@@ -170,6 +170,8 @@ Do not deploy the current 5 ms commit loop against R2 unchanged.
 
 For a low-rate notification queue, keep the one-file design and pace commits at one per second. Make `429` retryable and use a one-second batch. For higher rates, shard across queue files. If strict global FIFO across all jobs matters more than the one-file constraint, R2 is the wrong hot coordination store for this implementation. Durable Object SQLite or Cloudflare Queues can hold the live queue while R2 stores snapshots or an append-only audit log.
 
+The broker now paces commits with `QUEUE_COMMIT_INTERVAL_MS=1000` and retries R2 429/transient errors with jittered backoff; the remote matrix remains unmeasured.
+
 ## Remote benchmark still needed
 
 After R2 is enabled on the Cloudflare account, run a separate remote matrix with fresh queue names:
