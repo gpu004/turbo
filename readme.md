@@ -28,6 +28,8 @@ npm run format:check
 npm run dev
 ```
 
+Git hooks install automatically on `npm install`. CI runs `npm run types`, `npm run check`, and `npm test`; pull requests also validate commit messages.
+
 Wrangler simulates both R2 and Durable Objects locally.
 
 `npm run lint` uses Oxlint. `npm run format` writes Oxfmt formatting, and `npm run format:check` verifies it without changing files. `npm run check` runs linting, formatting checks, the Wrangler dry run, and TypeScript checking.

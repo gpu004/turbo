@@ -250,7 +250,7 @@ export function assertQueueFile(value: unknown, expectedQueue: string): asserts 
     throw new Error(`R2 object for queue ${expectedQueue} has an incompatible format`);
   }
   if (!Array.isArray(value.jobs) || typeof value.revision !== "number") {
-    throw new Error(`R2 object for queue ${expectedQueue} is malformed`);
+    throw new TypeError(`R2 object for queue ${expectedQueue} is malformed`);
   }
 }
 

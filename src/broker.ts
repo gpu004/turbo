@@ -193,11 +193,13 @@ export class QueueBroker extends DurableObject<Env> {
     minimum: number,
     maximum: number,
   ): number {
-    const parsed = Number.parseInt(this.env[name], 10);
+    const parsed = Math.trunc(Number(this.env[name]));
     return Number.isFinite(parsed) && parsed >= minimum && parsed <= maximum ? parsed : fallback;
   }
 }
 
 function delay(milliseconds: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+  return new Promise((resolve) => {
+    setTimeout(resolve, milliseconds);
+  });
 }

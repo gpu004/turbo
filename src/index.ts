@@ -3,7 +3,7 @@ import type { MutationResult } from "./model";
 
 export { QueueBroker };
 
-const QUEUE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const QUEUE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
 const MAX_IDEMPOTENCY_KEY_LENGTH = 200;
 
 class HttpError extends Error {
@@ -125,7 +125,7 @@ async function readJson(request: Request, env: Env): Promise<Record<string, unkn
   if (!request.body) throw new HttpError(400, "invalid_json", "JSON request body is required");
 
   const maxBytes = boundedInteger(env.MAX_REQUEST_BYTES, 256 * 1024, 1_024, 4 * 1024 * 1024);
-  const declaredLength = Number.parseInt(request.headers.get("content-length") ?? "", 10);
+  const declaredLength = Math.trunc(Number(request.headers.get("content-length") ?? ""));
   if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
     throw new HttpError(413, "body_too_large", `request body exceeds ${maxBytes} bytes`);
   }
@@ -167,7 +167,10 @@ async function readJson(request: Request, env: Env): Promise<Record<string, unkn
 
 function parseSegments(pathname: string): string[] {
   try {
-    return pathname.split("/").filter(Boolean).map(decodeURIComponent);
+    return pathname
+      .split("/")
+      .filter((segment) => segment.length > 0)
+      .map((segment) => decodeURIComponent(segment));
   } catch {
     throw new HttpError(400, "invalid_path", "path contains invalid percent encoding");
   }
@@ -203,7 +206,7 @@ function requireInteger(
 }
 
 function boundedInteger(value: string, fallback: number, minimum: number, maximum: number): number {
-  const parsed = Number.parseInt(value, 10);
+  const parsed = Math.trunc(Number(value));
   return Number.isFinite(parsed) && parsed >= minimum && parsed <= maximum ? parsed : fallback;
 }
 
