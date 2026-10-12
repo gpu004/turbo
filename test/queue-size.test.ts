@@ -34,6 +34,87 @@ describe("queue size limit", () => {
     expect(state.completed).toHaveLength(1);
     expect(state.completed[0]?.jobId).toBe(job?.id);
   });
+
+  it("evicts the oldest completion tombstone to make room for a claim", async () => {
+    const firstPush = await post("/queues/tombstone-pressure/jobs", { payload: "first" });
+    expect(firstPush.status).toBe(201);
+
+    const firstClaimResponse = await post("/queues/tombstone-pressure/claims", {
+      workerId: "worker",
+    });
+
+    const firstClaim = await firstClaimResponse.json<ClaimResponse>();
+    const firstJob = firstClaim.jobs[0];
+
+    if (!firstJob) throw new Error("claim returned no job");
+
+    const firstLeaseToken = firstJob.lease?.token;
+
+    if (!firstLeaseToken) throw new Error("claim returned a job without a lease token");
+
+    const firstCompletion = await post(`/queues/tombstone-pressure/jobs/${firstJob.id}/complete`, {
+      leaseToken: firstLeaseToken,
+    });
+
+    expect(firstCompletion.status).toBe(200);
+
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    const secondPush = await post("/queues/tombstone-pressure/jobs", { payload: "second" });
+    expect(secondPush.status).toBe(201);
+
+    const secondClaimResponse = await post("/queues/tombstone-pressure/claims", {
+      workerId: "worker",
+    });
+
+    const secondClaim = await secondClaimResponse.json<ClaimResponse>();
+    const secondJob = secondClaim.jobs[0];
+
+    if (!secondJob) throw new Error("claim returned no job");
+
+    const secondLeaseToken = secondJob.lease?.token;
+
+    if (!secondLeaseToken) throw new Error("claim returned a job without a lease token");
+
+    const secondCompletion = await post(
+      `/queues/tombstone-pressure/jobs/${secondJob.id}/complete`,
+      { leaseToken: secondLeaseToken },
+    );
+
+    expect(secondCompletion.status).toBe(200);
+
+    const pendingPush = await post("/queues/tombstone-pressure/jobs", {
+      payload: "x".repeat(800),
+    });
+
+    expect(pendingPush.status).toBe(201);
+
+    const beforePressure = await exports.default.fetch(
+      "https://queue.test/queues/tombstone-pressure",
+    );
+
+    const previousState = await beforePressure.json<QueueState>();
+    const oldestJobId = previousState.completed[0]?.jobId;
+
+    expect(previousState.completed).toHaveLength(2);
+    expect(oldestJobId).toBe(firstJob.id);
+
+    const pressureClaim = await post("/queues/tombstone-pressure/claims", {
+      workerId: "worker",
+    });
+
+    expect(pressureClaim.status).toBe(200);
+    expect((await pressureClaim.json<ClaimResponse>()).jobs).toHaveLength(1);
+
+    const afterPressure = await exports.default.fetch(
+      "https://queue.test/queues/tombstone-pressure",
+    );
+
+    const state = await afterPressure.json<QueueState>();
+
+    expect(state.completed.map((completed) => completed.jobId)).toEqual([secondJob.id]);
+    expect(state.completed.map((completed) => completed.jobId)).not.toContain(oldestJobId);
+  });
 });
 
 function post(path: string, body: JsonValue): Promise<Response> {

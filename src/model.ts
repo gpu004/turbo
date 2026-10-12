@@ -271,16 +271,35 @@ export function applyBatch(
   source: QueueFile,
   mutations: QueueMutation[],
   rejectPushes: ReadonlySet<number> = new Set(),
+  evictCompleted = 0,
 ): BatchResult {
   const file = structuredClone(source);
   const results: MutationResult[] = [];
   let changed = false;
 
-  const batchNow = mutations.at(-1)?.now;
+  let earliestMutationMs: number | undefined;
 
-  if (batchNow) {
-    const nowMs = Date.parse(batchNow);
-    file.completed = file.completed.filter((job) => Date.parse(job.expiresAt) > nowMs);
+  for (const mutation of mutations) {
+    const mutationMs = Date.parse(mutation.now);
+
+    if (earliestMutationMs === undefined || mutationMs < earliestMutationMs) {
+      earliestMutationMs = mutationMs;
+    }
+  }
+
+  if (earliestMutationMs !== undefined) {
+    file.completed = file.completed.filter((job) => Date.parse(job.expiresAt) > earliestMutationMs);
+  }
+
+  if (evictCompleted > 0) {
+    const oldestCompleted = file.completed
+      .toSorted((first, second) => Date.parse(first.completedAt) - Date.parse(second.completedAt))
+      .slice(0, evictCompleted);
+
+    const evictedCompleted = new Set(oldestCompleted);
+
+    file.completed = file.completed.filter((job) => !evictedCompleted.has(job));
+    changed = oldestCompleted.length > 0;
   }
 
   for (const [index, mutation] of mutations.entries()) {

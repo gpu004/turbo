@@ -145,6 +145,27 @@ describe("queue model", () => {
     expect(afterExpiry.file.completed).toEqual([]);
   });
 
+  it("keeps near-expiry tombstones for earlier pushes in the same batch", () => {
+    const queued = applyBatch(emptyQueue("indexing", NOW), [push("job-1", "wal-1")]).file;
+    const leased = applyBatch(queued, [claim("worker-a", ["lease-a"], NOW)]).file;
+    const completed = applyBatch(leased, [complete("job-1", "lease-a", NOW, 60)]);
+    const withOtherJob = applyBatch(completed.file, [push("job-2")]).file;
+    const duplicateAt = "2026-08-31T12:00:59.999Z";
+    const afterExpiry = "2026-08-31T12:01:00.001Z";
+
+    const applied = applyBatch(withOtherJob, [
+      push("job-3", "wal-1", duplicateAt),
+      claim("worker-b", ["lease-b"], afterExpiry),
+    ]);
+
+    expect(applied.results[0]).toMatchObject({
+      ok: true,
+      kind: "push",
+      duplicate: true,
+      jobId: "job-1",
+    });
+  });
+
   it("distinguishes unknown jobs and repeated completed jobs", () => {
     const unknown = applyBatch(emptyQueue("indexing", NOW), [complete("missing", "lease-a", NOW)]);
     expect(unknown.results[0]).toMatchObject({

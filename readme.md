@@ -16,7 +16,7 @@ R2 is the durable record. Durable Objects coordinate access, but the broker can 
 - conditional R2 writes, so an unexpected second writer cannot silently overwrite the queue
 - one broker per queue, which avoids a global Durable Object bottleneck
 
-The JSON-file design rewrites the whole queue on each group commit. Completed-job tombstones count toward `MAX_QUEUE_BYTES`, so queues should stay comfortably below the configured 8 MiB default. Job payloads should contain references to large data, not the data itself. The lower cap leaves room for the source object, the updated copy, and serialized JSON inside Cloudflare's 128 MB isolate limit.
+The JSON-file design rewrites the whole queue on each group commit. Completed-job tombstones count toward `MAX_QUEUE_BYTES`, so queues should stay comfortably below the configured 8 MiB default. Under size pressure, the oldest completion tombstones are evicted early, so idempotency after completion is best-effort within `COMPLETED_RETENTION_SECONDS`. Job payloads should contain references to large data, not the data itself. The lower cap leaves room for the source object, the updated copy, and serialized JSON inside Cloudflare's 128 MB isolate limit.
 
 ## Run it locally
 

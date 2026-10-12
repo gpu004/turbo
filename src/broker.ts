@@ -163,7 +163,8 @@ export class QueueBroker extends DurableObject<Env> {
     for (let attempt = 0; attempt < 5; attempt += 1) {
       const snapshot = await this.load(queue, attempt > 0);
       const rejectPushes = new Set<number>();
-      let applied = applyBatch(snapshot.file, mutations, rejectPushes);
+      let evictCompleted = 0;
+      let applied = applyBatch(snapshot.file, mutations, rejectPushes, evictCompleted);
 
       if (!applied.changed) return applied.results;
 
@@ -186,10 +187,28 @@ export class QueueBroker extends DurableObject<Env> {
         }
 
         if (!rejectedPush) {
-          throw new Error(`queue exceeds configured MAX_QUEUE_BYTES of ${maxBytes}`);
+          let evictedBytes = 0;
+          let evictedCount = 0;
+
+          const oldestCompleted = applied.file.completed.toSorted(
+            (first, second) => Date.parse(first.completedAt) - Date.parse(second.completedAt),
+          );
+
+          for (const completed of oldestCompleted) {
+            if (evictedBytes >= overflow) break;
+
+            evictedBytes += encoder.encode(JSON.stringify(completed)).byteLength + 1;
+            evictedCount += 1;
+          }
+
+          if (evictedCount === 0) {
+            throw new Error(`queue exceeds configured MAX_QUEUE_BYTES of ${maxBytes}`);
+          }
+
+          evictCompleted += evictedCount;
         }
 
-        applied = applyBatch(snapshot.file, mutations, rejectPushes);
+        applied = applyBatch(snapshot.file, mutations, rejectPushes, evictCompleted);
 
         if (!applied.changed) return applied.results;
         body = JSON.stringify(applied.file);
