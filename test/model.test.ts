@@ -1,7 +1,30 @@
 import { describe, expect, it } from "vitest";
-import { applyBatch, emptyQueue, type QueueMutation } from "../src/model";
+import { applyBatch, emptyQueue, parseQueueFile, type QueueMutation } from "../src/model";
 
 const NOW = "2026-08-31T12:00:00.000Z";
+
+describe("queue file parser", () => {
+  it("parses a valid queue file", () => {
+    const file = emptyQueue("q", NOW);
+
+    expect(parseQueueFile(JSON.stringify(file), "q")).toEqual(file);
+  });
+
+  it("rejects a queue file for a different queue", () => {
+    const file = emptyQueue("other", NOW);
+
+    expect(() => parseQueueFile(JSON.stringify(file), "q")).toThrow(
+      "R2 object for queue q has an incompatible format",
+    );
+  });
+
+  it("rejects invalid JSON and malformed queue files", () => {
+    expect(() => parseQueueFile("not json", "q")).toThrow("R2 object for queue q is malformed");
+    expect(() => parseQueueFile('{"version":1,"queue":"q","jobs":"x"}', "q")).toThrow(
+      "R2 object for queue q is malformed",
+    );
+  });
+});
 
 describe("queue model", () => {
   it("deduplicates pushes by idempotency key", () => {

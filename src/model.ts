@@ -55,7 +55,7 @@ const LeaseSchema: z.ZodType<Lease> = z
     heartbeatAt: z.string(),
     expiresAt: z.string(),
   })
-  .passthrough();
+  .loose();
 
 const QueueJobSchema: z.ZodType<QueueJob> = z
   .object({
@@ -67,7 +67,7 @@ const QueueJobSchema: z.ZodType<QueueJob> = z
     state: z.enum(["pending", "leased"]),
     lease: LeaseSchema.exactOptional(),
   })
-  .passthrough();
+  .loose();
 
 const QueueFileSchema: z.ZodType<QueueFile> = z
   .object({
@@ -78,12 +78,12 @@ const QueueFileSchema: z.ZodType<QueueFile> = z
         kind: z.literal("durable-object"),
         name: z.string(),
       })
-      .passthrough(),
+      .loose(),
     revision: z.number(),
     updatedAt: z.string(),
     jobs: z.array(QueueJobSchema),
   })
-  .passthrough();
+  .loose();
 
 export type QueueMutation =
   | {
@@ -172,13 +172,6 @@ export const CompleteResultSchema: z.ZodType<Extract<MutationResult, { kind: "co
     }),
     MutationFailureSchema.extend({ kind: z.literal("complete") }),
   ]);
-
-export const MutationResultSchema: z.ZodType<MutationResult> = z.union([
-  PushResultSchema,
-  ClaimResultSchema,
-  HeartbeatResultSchema,
-  CompleteResultSchema,
-]);
 
 export interface BatchResult {
   file: QueueFile;
@@ -355,10 +348,18 @@ function validateLease(
   return { ok: true, job, lease: job.lease };
 }
 
-export function parseQueueFile(value: JsonValue, expectedQueue: string): QueueFile {
+export function parseQueueFile(text: string, expectedQueue: string): QueueFile {
+  let value: unknown;
+
+  try {
+    value = JSON.parse(text);
+  } catch {
+    throw new Error(`R2 object for queue ${expectedQueue} is malformed`);
+  }
+
   const identity = z
     .object({ version: z.literal(1), queue: z.string() })
-    .passthrough()
+    .loose()
     .safeParse(value);
 
   if (!identity.success || identity.data.queue !== expectedQueue) {

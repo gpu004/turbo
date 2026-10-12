@@ -197,8 +197,7 @@ export class QueueBroker extends DurableObject<Env> {
       return snapshot;
     }
 
-    const value = JsonValueSchema.parse(await object.json());
-    const snapshot = { file: parseQueueFile(value, queue), etag: object.etag };
+    const snapshot = { file: parseQueueFile(await object.text(), queue), etag: object.etag };
     this.snapshot = snapshot;
 
     return snapshot;
