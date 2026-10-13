@@ -11,7 +11,7 @@ import { z } from "zod";
 
 export { QueueBroker };
 
-const QUEUE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const QUEUE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
 
 const MAX_IDEMPOTENCY_KEY_LENGTH = 200;
 
@@ -22,7 +22,7 @@ const invalidPayloadError = "payload is required";
 const PushBodySchema = z.object(
   {
     payload: JsonValueSchema,
-    idempotencyKey: z.string().optional().catch(undefined),
+    idempotencyKey: z.string().nullable().catch(null),
   },
   { error: requestObjectError },
 );
@@ -228,7 +228,10 @@ async function readJson<T>(request: Request, env: Env, schema: z.ZodType<T>): Pr
 
 function parseSegments(pathname: string): string[] {
   try {
-    return pathname.split("/").filter(Boolean).map(decodeURIComponent);
+    return pathname
+      .split("/")
+      .filter((segment) => segment.length > 0)
+      .map((segment) => decodeURIComponent(segment));
   } catch {
     throw new HttpError(400, "invalid_path", "path contains invalid percent encoding");
   }

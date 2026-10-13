@@ -36,10 +36,7 @@ describe("queue Worker", () => {
     const claim = await claimResponse.json<ClaimResponse>();
     expect(claim.jobs).toHaveLength(1);
     expect(claim.jobs[0]?.id).toBe(first.job.id);
-    const leaseToken = claim.jobs[0]?.lease?.token;
-    expect(leaseToken).toBeTypeOf("string");
-
-    if (!leaseToken) throw new Error("claim returned a job without a lease token");
+    const leaseToken = leaseTokenOf(claim.jobs[0]);
 
     const wrongCompletion = await post(`/queues/integration/jobs/${first.job.id}/complete`, {
       leaseToken: "wrong-token",
@@ -129,4 +126,12 @@ interface PushResponse {
 
 interface ClaimResponse {
   jobs: Array<{ id: string; lease?: { token: string } }>;
+}
+
+function leaseTokenOf(job: ClaimResponse["jobs"][number] | undefined): string {
+  const token = job?.lease?.token;
+
+  if (token === undefined) throw new Error("claim returned a job without a lease token");
+
+  return token;
 }

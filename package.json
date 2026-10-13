@@ -7,24 +7,39 @@
   "scripts": {
     "deploy": "wrangler deploy",
     "dev": "wrangler dev",
-    "lint": "oxlint src test vitest.config.ts",
+    "lint": "oxlint .",
     "format": "oxfmt --write .",
     "format:check": "oxfmt --check .",
     "check": "npm run lint && npm run format:check && wrangler deploy --dry-run && tsc --noEmit",
     "test": "vitest run",
-    "types": "wrangler types"
+    "types": "wrangler types",
+    "prepare": "simple-git-hooks"
   },
   "dependencies": {
     "zod": "^4.6.7"
   },
   "devDependencies": {
     "@cloudflare/vitest-plugin": "1.1.7",
+    "@commitlint/cli": "21.2.3",
+    "@commitlint/config-conventional": "21.2.3",
     "@oxlint/plugins": "1.80.0",
     "@types/node": "^24.3.0",
     "oxfmt": "^0.65.0",
     "oxlint": "^1.80.0",
+    "simple-git-hooks": "2.14.0",
     "typescript": "^7.0.2",
     "vitest": "^4.1.11",
     "wrangler": "4.131.0"
+  },
+  "simple-git-hooks": {
+    "pre-commit": "npm run lint && npm run format:check && npm run types && npx tsc --noEmit",
+    "commit-msg": "npx --no -- commitlint --edit \"$1\""
+  },
+  "allowScripts": {
+    "workerd@1.20260910.1": true,
+    "workerd@1.20260825.1": true,
+    "workerd@1.20260815.1": true,
+    "esbuild@0.28.1": true,
+    "simple-git-hooks@2.14.0": true
   }
 }

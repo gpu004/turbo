@@ -1,6 +1,6 @@
 {
   "$schema": "./node_modules/oxlint/configuration_schema.json",
-  "plugins": ["typescript", "unicorn", "oxc"],
+  "plugins": ["typescript", "unicorn", "oxc", "import", "vitest"],
   "ignorePatterns": [
     ".agent/**",
     ".agents/**",
@@ -22,9 +22,17 @@
     }
   ],
   "categories": {
-    "correctness": "error"
+    "correctness": "error",
+    "suspicious": "error",
+    "perf": "error",
+    "pedantic": "error"
   },
   "rules": {
+    "max-lines-per-function": "off",
+    "max-lines": "off",
+    "no-await-in-loop": "off",
+    "unicorn/prefer-number-coercion": "off",
+    "unicorn/prefer-top-level-await": "off",
     "oxc/no-accumulating-spread": "error",
     "anti-slop/no-array-filter-map": "error",
     "anti-slop/no-reduce-accumulator-copy": "error",

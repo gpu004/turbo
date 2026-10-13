@@ -28,6 +28,8 @@ npm run format:check
 npm run dev
 ```
 
+Git hooks install automatically on `npm install`. CI runs `npm run types`, `npm run check`, and `npm test`; pull requests also validate commit messages.
+
 Wrangler simulates both R2 and Durable Objects locally.
 
 `npm run lint` uses Oxlint with the vendored anti-slop plugin at `tools/oxlint/anti-slop`. See the [upstream record](tools/oxlint/anti-slop/UPSTREAM.md) for its source and local changes.
