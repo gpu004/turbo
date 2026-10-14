@@ -124,6 +124,10 @@ async function route(request: Request, env: Env): Promise<Response> {
       JSON.parse(await broker.push(queue, JSON.stringify(input.payload), idempotencyKey)),
     );
 
+    if (!result.ok) {
+      return json({ error: { code: result.code, message: result.message } }, 507);
+    }
+
     return json(result, result.duplicate ? 200 : 201);
   }
 

@@ -2,8 +2,9 @@ import { DurableObject } from "cloudflare:workers";
 import {
   applyBatch,
   emptyQueue,
-  parseQueueFile,
   JsonValueSchema,
+  parseQueueFile,
+  publicQueueFile,
   type MutationResult,
   type QueueFile,
   type QueueMutation,
@@ -85,6 +86,7 @@ export class QueueBroker extends DurableObject<Env> {
       jobId,
       leaseToken,
       now: new Date().toISOString(),
+      retainSeconds: this.integerSetting("COMPLETED_RETENTION_SECONDS", 3_600, 1, 604_800),
     });
 
     if (result.kind !== "complete") throw new Error("broker returned the wrong mutation result");
@@ -98,7 +100,7 @@ export class QueueBroker extends DurableObject<Env> {
     if (this.flushPromise) await this.flushPromise;
     const snapshot = await this.load(queue, true);
 
-    return JSON.stringify(snapshot.file);
+    return JSON.stringify(publicQueueFile(snapshot.file));
   }
 
   private bindQueue(queue: string): void {
@@ -149,23 +151,68 @@ export class QueueBroker extends DurableObject<Env> {
 
     if (!queue) throw new Error("queue broker is not initialized");
 
+    const maxBytes = this.integerSetting(
+      "MAX_QUEUE_BYTES",
+      8 * 1024 * 1024,
+      1_024,
+      32 * 1024 * 1024,
+    );
+
+    const encoder = new TextEncoder();
+
     for (let attempt = 0; attempt < 5; attempt += 1) {
       const snapshot = await this.load(queue, attempt > 0);
-      const applied = applyBatch(snapshot.file, mutations);
+      const rejectPushes = new Set<number>();
+      let evictCompleted = 0;
+      let applied = applyBatch(snapshot.file, mutations, rejectPushes, evictCompleted);
 
       if (!applied.changed) return applied.results;
 
-      const body = JSON.stringify(applied.file);
+      let body = JSON.stringify(applied.file);
+      let bodyBytes = encoder.encode(body).byteLength;
 
-      const maxBytes = this.integerSetting(
-        "MAX_QUEUE_BYTES",
-        8 * 1024 * 1024,
-        1_024,
-        32 * 1024 * 1024,
-      );
+      while (bodyBytes > maxBytes) {
+        let overflow = bodyBytes - maxBytes;
+        let rejectedPush = false;
 
-      if (new TextEncoder().encode(body).byteLength > maxBytes) {
-        throw new Error(`queue exceeds configured MAX_QUEUE_BYTES of ${maxBytes}`);
+        for (let index = mutations.length - 1; index >= 0 && overflow > 0; index -= 1) {
+          if (rejectPushes.has(index)) continue;
+          const result = applied.results[index];
+
+          if (!result?.ok || result.kind !== "push" || result.duplicate) continue;
+
+          rejectPushes.add(index);
+          rejectedPush = true;
+          overflow -= encoder.encode(JSON.stringify(result.job)).byteLength + 1;
+        }
+
+        if (!rejectedPush) {
+          let evictedBytes = 0;
+          let evictedCount = 0;
+
+          const oldestCompleted = applied.file.completed.toSorted(
+            (first, second) => Date.parse(first.completedAt) - Date.parse(second.completedAt),
+          );
+
+          for (const completed of oldestCompleted) {
+            if (evictedBytes >= overflow) break;
+
+            evictedBytes += encoder.encode(JSON.stringify(completed)).byteLength + 1;
+            evictedCount += 1;
+          }
+
+          if (evictedCount === 0) {
+            throw new Error(`queue exceeds configured MAX_QUEUE_BYTES of ${maxBytes}`);
+          }
+
+          evictCompleted += evictedCount;
+        }
+
+        applied = applyBatch(snapshot.file, mutations, rejectPushes, evictCompleted);
+
+        if (!applied.changed) return applied.results;
+        body = JSON.stringify(applied.file);
+        bodyBytes = encoder.encode(body).byteLength;
       }
 
       const stored = await this.env.QUEUE_BUCKET.put(this.objectKey(queue), body, {
@@ -208,7 +255,11 @@ export class QueueBroker extends DurableObject<Env> {
   }
 
   private integerSetting(
-    name: "QUEUE_BATCH_WINDOW_MS" | "QUEUE_LEASE_SECONDS" | "MAX_QUEUE_BYTES",
+    name:
+      | "QUEUE_BATCH_WINDOW_MS"
+      | "QUEUE_LEASE_SECONDS"
+      | "MAX_QUEUE_BYTES"
+      | "COMPLETED_RETENTION_SECONDS",
     fallback: number,
     minimum: number,
     maximum: number,

@@ -11,11 +11,12 @@ R2 is the durable record. Durable Objects coordinate access, but the broker can 
 - FIFO claims among jobs that are ready to run
 - at-least-once execution through expiring leases
 - fencing tokens, so an old worker cannot heartbeat or complete a reassigned job
-- idempotent pushes when the client supplies an `Idempotency-Key`
+- idempotent pushes for `COMPLETED_RETENTION_SECONDS` after a job completes when the client supplies an `Idempotency-Key`
+- lease tokens are never returned by queue inspection
 - conditional R2 writes, so an unexpected second writer cannot silently overwrite the queue
 - one broker per queue, which avoids a global Durable Object bottleneck
 
-Each group commit rewrites the whole queue. Keep queue metadata below the default 8 MiB cap. Job payloads should reference large data rather than contain it. The cap leaves room for the source object, the updated copy, and serialized JSON within Cloudflare's 128 MB isolate limit.
+Each group commit rewrites the whole queue. Completed-job tombstones count toward `MAX_QUEUE_BYTES`. Under size pressure, the oldest completion tombstones are evicted early, so idempotency after completion is best-effort within `COMPLETED_RETENTION_SECONDS`. Keep queue metadata below the default 8 MiB cap. Job payloads should reference large data rather than contain it. The cap leaves room for the source object, the updated copy, and serialized JSON within Cloudflare's 128 MB isolate limit.
 
 ## Run it locally
 
@@ -73,6 +74,8 @@ curl -s http://localhost:8787/queues/indexing
 
 `GET /health` does not touch R2. It only confirms that the Worker is running.
 
+Completing a job that does not exist returns `404`; a stale or mismatched lease returns `409`. A push that cannot fit within `MAX_QUEUE_BYTES` returns `507` with code `queue_full`.
+
 ## Deploy
 
 Create the bucket once, then deploy:
@@ -92,6 +95,7 @@ The defaults live in `wrangler.jsonc`:
 | --- | ---: | --- |
 | `QUEUE_BATCH_WINDOW_MS` | `5` | Time the broker waits to collect the first commit batch |
 | `QUEUE_LEASE_SECONDS` | `60` | Time before another worker may reclaim a job |
+| `COMPLETED_RETENTION_SECONDS` | `3600` | How long completed jobs retain idempotency keys |
 | `MAX_QUEUE_BYTES` | `8388608` | Maximum serialized queue object size |
 | `MAX_REQUEST_BYTES` | `262144` | Maximum JSON request body size |
 
