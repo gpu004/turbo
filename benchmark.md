@@ -174,6 +174,8 @@ Larger batches lower request cost and the bytes rewritten per job. On R2, batchi
 
 Do not deploy the current 5 ms commit loop against R2 unchanged.
 
+The broker now writes each queue at most once per `QUEUE_COMMIT_INTERVAL_MS` (default `1000`) and retries `429` and transient R2 errors with jittered backoff. The remote measurements below are still needed to confirm that against real R2.
+
 For a low-rate notification queue, keep the one-file design and pace commits at one per second. Retry `429` responses and use a one-second batch. For higher rates, split jobs across queue files. If strict global FIFO across all jobs matters more than the one-file constraint, do not use R2 to coordinate the live queue. Use Durable Object SQLite or Cloudflare Queues instead, with R2 for snapshots or an append-only audit log.
 
 ## Remote benchmark still needed

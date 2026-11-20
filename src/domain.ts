@@ -20,6 +20,10 @@ export const LeaseToken = Schema.NonEmptyString.pipe(Schema.brand("LeaseToken"))
 
 export type LeaseToken = typeof LeaseToken.Type;
 
+export const CommitId = Schema.NonEmptyString.pipe(Schema.brand("CommitId"));
+
+export type CommitId = typeof CommitId.Type;
+
 export const WorkerId = Schema.NonEmptyString.pipe(Schema.brand("WorkerId"));
 
 export type WorkerId = typeof WorkerId.Type;
@@ -40,11 +44,13 @@ export class Ids extends Context.Service<
   {
     readonly newJobId: () => JobId;
     readonly newLeaseToken: () => LeaseToken;
+    readonly newCommitId: () => CommitId;
   }
 >()("turbo/Ids") {
   static readonly layer = Layer.succeed(Ids, {
     newJobId: () => JobId.make(crypto.randomUUID()),
     newLeaseToken: () => LeaseToken.make(crypto.randomUUID()),
+    newCommitId: () => CommitId.make(crypto.randomUUID()),
   });
 }
 

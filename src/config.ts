@@ -23,7 +23,9 @@ type SettingsVar =
   | "QUEUE_LEASE_SECONDS"
   | "MAX_QUEUE_BYTES"
   | "MAX_REQUEST_BYTES"
-  | "COMPLETED_RETENTION_SECONDS";
+  | "COMPLETED_RETENTION_SECONDS"
+  | "QUEUE_COMMIT_INTERVAL_MS"
+  | "MAX_PENDING_MUTATIONS";
 
 export type SettingsEnv = Partial<Readonly<Record<SettingsVar, string>>>;
 
@@ -33,6 +35,8 @@ const settingsConfig = Config.all({
   maxQueueBytes: boundedInteger("MAX_QUEUE_BYTES", 8 * 1024 * 1024, 1_024, 32 * 1024 * 1024),
   maxRequestBytes: boundedInteger("MAX_REQUEST_BYTES", 256 * 1024, 1_024, 4 * 1024 * 1024),
   completedRetentionSeconds: boundedInteger("COMPLETED_RETENTION_SECONDS", 3_600, 1, 604_800),
+  commitIntervalMs: boundedInteger("QUEUE_COMMIT_INTERVAL_MS", 1_000, 0, 60_000),
+  maxPendingMutations: boundedInteger("MAX_PENDING_MUTATIONS", 10_000, 1, 1_000_000),
 });
 
 export class Settings extends Context.Service<
@@ -43,6 +47,8 @@ export class Settings extends Context.Service<
     readonly maxQueueBytes: number;
     readonly maxRequestBytes: number;
     readonly completedRetentionSeconds: number;
+    readonly commitIntervalMs: number;
+    readonly maxPendingMutations: number;
   }
 >()("turbo/Settings") {
   // Every variable has a fallback, so parsing cannot fail.

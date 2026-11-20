@@ -1,14 +1,17 @@
-import { Effect, Exit, Layer, Option } from "effect";
+import { Clock, Effect, Exit, Layer, Option } from "effect";
 import { describe, expect, it } from "vitest";
 import {
   Background,
   Broker,
   CommitAttemptsExhausted,
+  Overloaded,
   QueueStore,
+  StorageFailure,
   type StoredQueue,
 } from "../src/broker";
 import { Settings, type SettingsEnv } from "../src/config";
 import {
+  CommitId,
   IdempotencyKey,
   Ids,
   Instant,
@@ -30,17 +33,24 @@ const NOW = Instant.make("2026-08-31T12:00:00.000Z");
 interface MemoryStore {
   readonly layer: Layer.Layer<QueueStore>;
   readonly puts: () => number;
+  readonly putTimes: () => readonly number[];
   readonly file: () => QueueFile | undefined;
 }
+
+// How the store fails the nth put (counting from 1): before writing, or after
+// writing, as when R2 applies a write but the response is lost.
+type PutFailure = (put: number) => { readonly landed: boolean; readonly code: number } | undefined;
 
 // `beforePut` runs before each write is checked, so a test can play a second
 // writer that changes the object underneath the broker.
 function memoryStore(
   beforePut: (write: (file: QueueFile) => void) => void = () => {},
+  failPut: PutFailure = () => undefined,
 ): MemoryStore {
   let object: StoredQueue | undefined;
   let version = 0;
   let puts = 0;
+  const putTimes: number[] = [];
 
   const write = (file: QueueFile): void => {
     version += 1;
@@ -50,9 +60,19 @@ function memoryStore(
   const layer = Layer.succeed(QueueStore, {
     get: () => Effect.sync(() => Option.fromNullishOr(object)),
     put: (_queue, body, etag) =>
-      Effect.sync(() => {
+      Effect.gen(function* () {
         puts += 1;
+        putTimes.push(yield* Clock.currentTimeMillis);
         beforePut(write);
+
+        const failure = failPut(puts);
+
+        const error = new StorageFailure({
+          message: `put failed: R2 error (${failure?.code})`,
+          retryable: [10058, 10001, 10043, 10054].includes(failure?.code ?? 0),
+        });
+
+        if (failure && !failure.landed) return yield* error;
 
         const matches = Option.match(etag, {
           onNone: () => object === undefined,
@@ -64,6 +84,8 @@ function memoryStore(
         version += 1;
         object = { text: body, etag: `etag-${version}` };
 
+        if (failure) return yield* error;
+
         return Option.some(object.etag);
       }),
   });
@@ -71,12 +93,16 @@ function memoryStore(
   return {
     layer,
     puts: () => puts,
+    putTimes: () => putTimes,
     file: () => (object ? Effect.runSync(parseQueueFile(object.text, Q)) : undefined),
   };
 }
 
+// Commit ids have their own counter, so job and lease numbers stay the same
+// however many commit attempts a test makes.
 function sequentialIds(): Layer.Layer<Ids> {
   let issued = 0;
+  let commits = 0;
 
   return Layer.succeed(Ids, {
     newJobId: () => {
@@ -88,6 +114,11 @@ function sequentialIds(): Layer.Layer<Ids> {
       issued += 1;
 
       return LeaseToken.make(`lease-${issued}`);
+    },
+    newCommitId: () => {
+      commits += 1;
+
+      return CommitId.make(`commit-${commits}`);
     },
   });
 }
@@ -102,7 +133,7 @@ function runBroker<A, E>(
   env: SettingsEnv = {},
 ): Promise<Exit.Exit<A, E>> {
   const services = Layer.mergeAll(
-    Settings.fromEnv({ QUEUE_BATCH_WINDOW_MS: "20", ...env }),
+    Settings.fromEnv({ QUEUE_BATCH_WINDOW_MS: "20", QUEUE_COMMIT_INTERVAL_MS: "0", ...env }),
     sequentialIds(),
     store.layer,
     forkedBackground,
@@ -262,5 +293,105 @@ describe("queue broker", () => {
     expect(completed.length).toBeGreaterThan(0);
     expect(completed.length).toBeLessThan(4);
     expect(completed).toEqual(["key-0", "key-1", "key-2", "key-3"].slice(4 - completed.length));
+  });
+
+  it("waits QUEUE_COMMIT_INTERVAL_MS between writes and batches what arrives meanwhile", async () => {
+    const store = memoryStore();
+
+    const exit = await runBroker(
+      store,
+      Broker.use((broker) =>
+        broker
+          .push(Q, { n: 1 }, undefined)
+          .pipe(
+            Effect.andThen(
+              Effect.all(
+                [broker.push(Q, { n: 2 }, undefined), broker.push(Q, { n: 3 }, undefined)],
+                { concurrency: "unbounded" },
+              ),
+            ),
+          ),
+      ),
+      { QUEUE_COMMIT_INTERVAL_MS: "300" },
+    );
+
+    const [first = 0, second = 0] = store.putTimes();
+
+    expect(Exit.isSuccess(exit)).toBe(true);
+    expect(store.puts()).toBe(2);
+    expect(second - first).toBeGreaterThanOrEqual(295);
+    expect(store.file()?.jobs).toHaveLength(3);
+  });
+
+  it("retries a write that R2 rejects with a retryable error", async () => {
+    const store = memoryStore(undefined, (put) =>
+      put === 1 ? { landed: false, code: 10058 } : undefined,
+    );
+
+    const exit = await runBroker(
+      store,
+      Broker.use((broker) => broker.push(Q, { n: 1 }, undefined)),
+    );
+
+    expect(exit).toEqual(Exit.succeed(expect.objectContaining({ ok: true, duplicate: false })));
+    expect(store.puts()).toBe(2);
+    expect(store.file()?.jobs).toHaveLength(1);
+  });
+
+  it("delivers a write that landed although R2 reported an error, without applying it twice", async () => {
+    const store = memoryStore(undefined, (put) =>
+      put === 1 ? { landed: true, code: 10001 } : undefined,
+    );
+
+    const exit = await runBroker(
+      store,
+      Broker.use((broker) =>
+        Effect.all([broker.push(Q, { n: 1 }, undefined), broker.push(Q, { n: 2 }, undefined)], {
+          concurrency: "unbounded",
+        }),
+      ),
+    );
+
+    expect(exit).toEqual(
+      Exit.succeed([
+        expect.objectContaining({ ok: true, job: expect.objectContaining({ id: "job-1" }) }),
+        expect.objectContaining({ ok: true, job: expect.objectContaining({ id: "job-2" }) }),
+      ]),
+    );
+    expect(store.puts()).toBe(1);
+    expect(store.file()?.revision).toBe(1);
+    expect(store.file()?.jobs.map((job) => job.id)).toEqual(["job-1", "job-2"]);
+  });
+
+  it("does not retry an R2 error that will not go away", async () => {
+    const store = memoryStore(undefined, () => ({ landed: false, code: 10007 }));
+
+    const exit = await runBroker(
+      store,
+      Broker.use((broker) => Effect.flip(broker.push(Q, { n: 1 }, undefined))),
+    );
+
+    expect(exit).toEqual(Exit.succeed(expect.any(StorageFailure)));
+    expect(store.puts()).toBe(1);
+  });
+
+  it("refuses mutations once MAX_PENDING_MUTATIONS are waiting", async () => {
+    const store = memoryStore();
+
+    const exit = await runBroker(
+      store,
+      Broker.use((broker) =>
+        Effect.all(
+          [broker.push(Q, { n: 1 }, undefined), Effect.flip(broker.push(Q, { n: 2 }, undefined))],
+          { concurrency: "unbounded" },
+        ),
+      ),
+      { MAX_PENDING_MUTATIONS: "1" },
+    );
+
+    expect(exit).toEqual(
+      Exit.succeed([expect.objectContaining({ ok: true }), expect.any(Overloaded)]),
+    );
+    expect(store.file()?.jobs).toHaveLength(1);
   });
 });

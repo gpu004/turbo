@@ -1,6 +1,7 @@
 import { Data, Effect, Schema } from "effect";
 import {
   addSeconds,
+  CommitId,
   IdempotencyKey,
   Instant,
   isAtOrAfter,
@@ -72,6 +73,9 @@ export interface QueueFile {
   };
   readonly revision: number;
   readonly updatedAt: Instant;
+  // Set by the commit that wrote this file, so a broker whose write failed
+  // ambiguously can tell on reload whether it landed. Absent in older files.
+  readonly commitId?: CommitId;
   readonly jobs: readonly QueueJob[];
   // Absent in files written before completed jobs were kept.
   readonly completed?: readonly CompletedJob[];
@@ -125,6 +129,7 @@ const QueueFileSchema: Schema.Decoder<QueueFile> = storedStruct({
   }),
   revision: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
   updatedAt: Instant,
+  commitId: Schema.optionalKey(CommitId),
   jobs: Schema.Array(QueueJobSchema),
   completed: Schema.optionalKey(Schema.Array(CompletedJobSchema)),
 }).check(

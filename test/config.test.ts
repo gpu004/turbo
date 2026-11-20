@@ -10,6 +10,8 @@ describe("Settings", () => {
       MAX_QUEUE_BYTES: "0x800",
       MAX_REQUEST_BYTES: "4096",
       COMPLETED_RETENTION_SECONDS: "60",
+      QUEUE_COMMIT_INTERVAL_MS: "250",
+      MAX_PENDING_MUTATIONS: "-1",
     };
 
     const settings = Effect.runSync(
@@ -22,6 +24,8 @@ describe("Settings", () => {
       maxQueueBytes: 8 * 1024 * 1024,
       maxRequestBytes: 4096,
       completedRetentionSeconds: 60,
+      commitIntervalMs: 250,
+      maxPendingMutations: 10_000,
     });
   });
 });
