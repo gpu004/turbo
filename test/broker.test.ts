@@ -490,4 +490,28 @@ describe("queue broker", () => {
     expect(store.puts()).toBe(3);
     expect(isAtOrAfter(heartbeatAt, addSeconds(requested, 0.55))).toBe(true);
   });
+
+  it("completes a job right after claiming it with the shortest lease and production pacing", async () => {
+    const store = memoryStore();
+
+    const exit = await runBroker(
+      store,
+      Broker.use(
+        Effect.fn(function* (broker) {
+          yield* broker.push(Q, { n: 1 }, undefined);
+
+          const [job] = (yield* broker.claim(Q, WorkerId.make("w"), 1)).jobs;
+
+          if (!job) throw new Error("expected a claimed job");
+
+          return yield* broker.complete(Q, job.id, job.lease.token);
+        }),
+      ),
+      { QUEUE_LEASE_SECONDS: "1", QUEUE_COMMIT_INTERVAL_MS: "1000" },
+    );
+
+    expect(exit).toEqual(
+      Exit.succeed(expect.objectContaining({ ok: true, alreadyCompleted: false })),
+    );
+  }, 10_000);
 });

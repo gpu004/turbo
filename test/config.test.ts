@@ -28,4 +28,14 @@ describe("Settings", () => {
       maxPendingMutations: 10_000,
     });
   });
+
+  it("raises a lease shorter than two commit intervals", () => {
+    const env = { QUEUE_LEASE_SECONDS: "1", QUEUE_COMMIT_INTERVAL_MS: "1000" };
+
+    const settings = Effect.runSync(
+      Settings.use(Effect.succeed).pipe(Effect.provide(Settings.fromEnv(env))),
+    );
+
+    expect(settings.leaseSeconds).toBe(2);
+  });
 });

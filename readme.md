@@ -104,7 +104,7 @@ The defaults live in `wrangler.jsonc`:
 | Variable | Default | Purpose |
 | --- | ---: | --- |
 | `QUEUE_BATCH_WINDOW_MS` | `5` | Time the broker waits to collect the first commit batch |
-| `QUEUE_LEASE_SECONDS` | `60` | Time before another worker may reclaim a job |
+| `QUEUE_LEASE_SECONDS` | `60` | Time before another worker may reclaim a job. Raised to at least two commit intervals, so a heartbeat sent right after a claim lands in time |
 | `QUEUE_COMMIT_INTERVAL_MS` | `1000` | Minimum time between the starts of two R2 writes for one queue |
 | `MAX_PENDING_MUTATIONS` | `10000` | Requests waiting for a commit before new ones get `503` |
 | `COMPLETED_RETENTION_SECONDS` | `3600` | How long a completed job's idempotency key and lease token are kept |
