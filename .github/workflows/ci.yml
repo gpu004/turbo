@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci
+
+      # worker-configuration.d.ts is generated from wrangler.jsonc and not committed.
+      - run: npm run types
+
+      # Lint, the turbo lint rules' own tests, formatting, Wrangler dry run,
+      # and tsc, which also enforces the @ts-expect-error cases in test/types.test.ts.
+      - run: npm run check
+
+      # Unit, property, and Worker integration tests.
+      - run: npm test
+
+  model-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - uses: actions/cache@v4
+        with:
+          path: .cache
+          key: tla2tools-${{ hashFiles('tools/tla/check.sh') }}
+
+      # TLC on spec/QueueBroker.tla, plus a run without compare-and-set that
+      # must fail.
+      - run: tools/tla/check.sh

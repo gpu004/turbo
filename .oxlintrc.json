@@ -19,6 +19,10 @@
     {
       "name": "anti-slop",
       "specifier": "./tools/oxlint/anti-slop/index.ts"
+    },
+    {
+      "name": "turbo",
+      "specifier": "./tools/oxlint/turbo/index.ts"
     }
   ],
   "categories": {
@@ -43,9 +47,62 @@
     "anti-slop/no-unsafe-dictionary-type": "error",
     "anti-slop/no-widen-then-assert": "error",
     "anti-slop/require-readable-spacing": "error",
-    "anti-slop/require-safety-comment-for-type-assertion": "error"
+    "anti-slop/require-safety-comment-for-type-assertion": "error",
+    "turbo/no-ambient-effects": "error",
+    "turbo/no-json-parse": "error",
+    "turbo/no-raw-env-vars": [
+      "error",
+      {
+        "bindings": ["QUEUE_BUCKET", "QUEUE_BROKER"]
+      }
+    ]
   },
   "env": {
     "builtin": true
-  }
+  },
+  "overrides": [
+    {
+      "files": ["src/domain.ts"],
+      "rules": {
+        "turbo/no-ambient-effects": "off",
+        "turbo/no-json-parse": "off"
+      }
+    },
+    {
+      "files": ["src/rpc.ts"],
+      "rules": {
+        "turbo/no-json-parse": "off"
+      }
+    },
+    {
+      "files": ["src/config.ts"],
+      "rules": {
+        "turbo/no-raw-env-vars": "off"
+      }
+    },
+    {
+      "files": ["src/domain.ts", "src/model.ts", "src/config.ts", "src/rpc.ts", "src/router.ts"],
+      "rules": {
+        "no-restricted-imports": [
+          "error",
+          {
+            "paths": [
+              {
+                "name": "cloudflare:workers",
+                "message": "Pure modules must not depend on the Workers runtime or the broker. Pass values in instead."
+              },
+              {
+                "name": "./broker",
+                "message": "Pure modules must not depend on the Workers runtime or the broker. Pass values in instead."
+              },
+              {
+                "name": "./index",
+                "message": "Pure modules must not depend on the Workers runtime or the broker. Pass values in instead."
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ]
 }

@@ -32,7 +32,11 @@ Wrangler simulates both R2 and Durable Objects locally.
 
 `npm run lint` uses Oxlint with the vendored anti-slop plugin at `tools/oxlint/anti-slop`. See the [upstream record](tools/oxlint/anti-slop/UPSTREAM.md) for its source and local changes.
 
-`npm run format` formats files with Oxfmt. `npm run format:check` checks formatting without changing files. `npm run check` runs linting, formatting checks, a Wrangler dry run, and TypeScript checking.
+The project rules in `tools/oxlint/turbo` each confine one operation, such as reading the clock or parsing JSON, to the module that owns it. `npm run lint:rules` tests them against the fixtures in `tools/oxlint/turbo/fixtures`.
+
+`npm run format` formats files with Oxfmt. `npm run format:check` checks formatting without changing files. `npm run check` runs linting, the lint-rule tests, formatting checks, a Wrangler dry run, and TypeScript checking.
+
+`npm run verify:tla` model-checks the broker's commit protocol in `spec/QueueBroker.tla` with TLC. It needs Java and downloads `tla2tools.jar` into `.cache/`. It also checks that the spec fails when the R2 compare-and-set is removed.
 
 ## API
 
