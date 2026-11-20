@@ -13,6 +13,13 @@
 (* a group commit gives the same results as applying its mutations one at  *)
 (* a time, which is what makes that simplification sound. FIFO order and  *)
 (* idempotency keys are also left to the property tests.                   *)
+(*                                                                         *)
+(* A batch that changes nothing is answered from the cached snapshot       *)
+(* without contacting R2. That path is not modeled. Its success replies,   *)
+(* `alreadyCompleted: true` for a job missing from the snapshot and        *)
+(* `duplicate: true` for a key already in it, are only sound while a       *)
+(* single broker holds the queue, so `acked` and `done` here count only    *)
+(* replies that followed a conditional write.                              *)
 (***************************************************************************)
 EXTENDS Naturals, FiniteSets, TLC
 

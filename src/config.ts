@@ -5,7 +5,11 @@ import { z } from "zod";
 // default, matching the documented behaviour of each variable.
 
 function boundedInteger(fallback: number, minimum: number, maximum: number) {
-  return z.coerce.number().int().min(minimum).max(maximum).catch(fallback);
+  return z
+    .string()
+    .transform((value) => Number.parseInt(value, 10))
+    .pipe(z.number().int().min(minimum).max(maximum))
+    .catch(fallback);
 }
 
 const ConfigSchema = z
@@ -24,6 +28,6 @@ const ConfigSchema = z
 
 export type Config = Readonly<z.infer<typeof ConfigSchema>>;
 
-export function parseConfig(env: Env): Config {
+export function parseConfig(env: z.input<typeof ConfigSchema>): Config {
   return ConfigSchema.parse(env);
 }
