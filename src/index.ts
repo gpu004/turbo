@@ -1,19 +1,20 @@
 import { QueueBroker } from "./broker";
+import { parseConfig, type Config } from "./config";
 import {
-  ClaimResultSchema,
-  CompleteResultSchema,
-  HeartbeatResultSchema,
+  IdempotencyKey,
+  JobId,
   JsonValueSchema,
-  PushResultSchema,
-  type MutationResult,
-} from "./model";
+  LeaseToken,
+  parseJson,
+  QueueName,
+  WorkerId,
+} from "./domain";
+import type { MutationResult, QueueFile } from "./model";
+import { route, type Route } from "./router";
+import { decode, encode, type Encoded } from "./rpc";
 import { z } from "zod";
 
 export { QueueBroker };
-
-const QUEUE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
-
-const MAX_IDEMPOTENCY_KEY_LENGTH = 200;
 
 const requestObjectError = "request body must be a JSON object";
 
@@ -29,7 +30,7 @@ const PushBodySchema = z.object(
 
 const ClaimBodySchema = z.object(
   {
-    workerId: stringField("workerId", 200),
+    workerId: stringField("workerId", 200).pipe(WorkerId),
     maxJobs: z
       .number({ error: "maxJobs must be an integer from 1 to 100" })
       .int("maxJobs must be an integer from 1 to 100")
@@ -41,7 +42,7 @@ const ClaimBodySchema = z.object(
 );
 
 const LeaseBodySchema = z.object(
-  { leaseToken: stringField("leaseToken", 200) },
+  { leaseToken: stringField("leaseToken", 200).pipe(LeaseToken) },
   { error: requestObjectError },
 );
 
@@ -55,10 +56,81 @@ class HttpError extends Error {
   }
 }
 
+interface RequestContext {
+  readonly request: Request;
+  readonly env: Env;
+  readonly config: Config;
+}
+
+const routes: ReadonlyArray<Route<RequestContext>> = [
+  route("GET", "/health", async () => json({ ok: true })),
+
+  route("GET", "/queues/:queue", async ({ env }, params) => {
+    const queue = pathParam(QueueName, params.queue, "invalid_queue");
+
+    return jsonText(await env.QUEUE_BROKER.getByName(queue).inspect(queue));
+  }),
+
+  route("POST", "/queues/:queue/jobs", async ({ request, env, config }, params) => {
+    const queue = pathParam(QueueName, params.queue, "invalid_queue");
+    const input = await readJson(request, config, PushBodySchema);
+    const rawKey = request.headers.get("idempotency-key")?.trim() || input.idempotencyKey?.trim();
+    const idempotencyKey = rawKey ? parseIdempotencyKey(rawKey) : undefined;
+
+    const result = decode(
+      await env.QUEUE_BROKER.getByName(queue).push(queue, encode(input.payload), idempotencyKey),
+    );
+
+    return json(result, result.duplicate ? 200 : 201);
+  }),
+
+  route("POST", "/queues/:queue/claims", async ({ request, env, config }, params) => {
+    const queue = pathParam(QueueName, params.queue, "invalid_queue");
+    const input = await readJson(request, config, ClaimBodySchema);
+
+    return jsonText(
+      await env.QUEUE_BROKER.getByName(queue).claim(queue, input.workerId, input.maxJobs),
+    );
+  }),
+
+  route(
+    "POST",
+    "/queues/:queue/jobs/:jobId/heartbeat",
+    async ({ request, env, config }, params) => {
+      const queue = pathParam(QueueName, params.queue, "invalid_queue");
+      const jobId = pathParam(JobId, params.jobId, "invalid_job_id");
+      const input = await readJson(request, config, LeaseBodySchema);
+
+      return mutationResponse(
+        decode(await env.QUEUE_BROKER.getByName(queue).heartbeat(queue, jobId, input.leaseToken)),
+      );
+    },
+  ),
+
+  route("POST", "/queues/:queue/jobs/:jobId/complete", async ({ request, env, config }, params) => {
+    const queue = pathParam(QueueName, params.queue, "invalid_queue");
+    const jobId = pathParam(JobId, params.jobId, "invalid_job_id");
+    const input = await readJson(request, config, LeaseBodySchema);
+
+    return mutationResponse(
+      decode(await env.QUEUE_BROKER.getByName(queue).complete(queue, jobId, input.leaseToken)),
+    );
+  }),
+];
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     try {
-      return await route(request, env);
+      const segments = parseSegments(new URL(request.url).pathname);
+      const context: RequestContext = { request, env, config: parseConfig(env) };
+
+      for (const candidate of routes) {
+        const handle = candidate.match(request.method, segments);
+
+        if (handle) return await handle(context);
+      }
+
+      throw new HttpError(404, "not_found", "route not found");
     } catch (error) {
       if (error instanceof HttpError) {
         return json({ error: { code: error.code, message: error.message } }, error.status);
@@ -79,88 +151,24 @@ export default {
   },
 } satisfies ExportedHandler<Env>;
 
-async function route(request: Request, env: Env): Promise<Response> {
-  const url = new URL(request.url);
+function pathParam<S extends z.ZodType>(schema: S, value: string, code: string): z.output<S> {
+  const parsed = schema.safeParse(value);
 
-  if (request.method === "GET" && url.pathname === "/health") {
-    return json({ ok: true });
+  if (!parsed.success) {
+    throw new HttpError(400, code, parsed.error.issues[0]?.message ?? `${code} in path`);
   }
 
-  const segments = parseSegments(url.pathname);
+  return parsed.data;
+}
 
-  if (segments[0] !== "queues" || !segments[1]) {
-    throw new HttpError(404, "not_found", "route not found");
+function parseIdempotencyKey(value: string): IdempotencyKey {
+  const parsed = IdempotencyKey.safeParse(value);
+
+  if (!parsed.success) {
+    throw new HttpError(400, "invalid_idempotency_key", "idempotency key is too long");
   }
 
-  const queue = segments[1];
-
-  if (!QUEUE_NAME.test(queue)) {
-    throw new HttpError(
-      400,
-      "invalid_queue",
-      "queue name must match [A-Za-z0-9][A-Za-z0-9._-]{0,127}",
-    );
-  }
-
-  const broker = env.QUEUE_BROKER.getByName(queue);
-
-  if (request.method === "GET" && segments.length === 2) {
-    return jsonText(await broker.inspect(queue));
-  }
-
-  if (request.method === "POST" && segments[2] === "jobs" && segments.length === 3) {
-    const input = await readJson(request, env, PushBodySchema);
-    const headerKey = request.headers.get("idempotency-key")?.trim();
-
-    const bodyKey = input.idempotencyKey?.trim();
-
-    const idempotencyKey = headerKey || bodyKey;
-
-    if (idempotencyKey && idempotencyKey.length > MAX_IDEMPOTENCY_KEY_LENGTH) {
-      throw new HttpError(400, "invalid_idempotency_key", "idempotency key is too long");
-    }
-
-    const result = PushResultSchema.parse(
-      JSON.parse(await broker.push(queue, JSON.stringify(input.payload), idempotencyKey)),
-    );
-
-    return json(result, result.duplicate ? 200 : 201);
-  }
-
-  if (request.method === "POST" && segments[2] === "claims" && segments.length === 3) {
-    const input = await readJson(request, env, ClaimBodySchema);
-
-    const result = ClaimResultSchema.parse(
-      JSON.parse(await broker.claim(queue, input.workerId, input.maxJobs)),
-    );
-
-    return json(result);
-  }
-
-  const jobId = segments[3];
-
-  if (
-    request.method === "POST" &&
-    segments[2] === "jobs" &&
-    jobId &&
-    (segments[4] === "heartbeat" || segments[4] === "complete") &&
-    segments.length === 5
-  ) {
-    const input = await readJson(request, env, LeaseBodySchema);
-
-    const result =
-      segments[4] === "heartbeat"
-        ? HeartbeatResultSchema.parse(
-            JSON.parse(await broker.heartbeat(queue, jobId, input.leaseToken)),
-          )
-        : CompleteResultSchema.parse(
-            JSON.parse(await broker.complete(queue, jobId, input.leaseToken)),
-          );
-
-    return mutationResponse(result);
-  }
-
-  throw new HttpError(404, "not_found", "route not found");
+  return parsed.data;
 }
 
 function mutationResponse(result: MutationResult): Response {
@@ -170,10 +178,10 @@ function mutationResponse(result: MutationResult): Response {
   return json({ error: { code: result.code, message: result.message } }, status);
 }
 
-async function readJson<T>(request: Request, env: Env, schema: z.ZodType<T>): Promise<T> {
+async function readJson<T>(request: Request, config: Config, schema: z.ZodType<T>): Promise<T> {
   if (!request.body) throw new HttpError(400, "invalid_json", "JSON request body is required");
 
-  const maxBytes = boundedInteger(env.MAX_REQUEST_BYTES, 256 * 1024, 1_024, 4 * 1024 * 1024);
+  const maxBytes = config.maxRequestBytes;
   const declaredLength = Number.parseInt(request.headers.get("content-length") ?? "", 10);
 
   if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
@@ -206,15 +214,11 @@ async function readJson<T>(request: Request, env: Env, schema: z.ZodType<T>): Pr
     offset += chunk.byteLength;
   }
 
-  let value: unknown;
+  const json = parseJson(new TextDecoder().decode(bytes));
 
-  try {
-    value = JSON.parse(new TextDecoder().decode(bytes));
-  } catch {
-    throw new HttpError(400, "invalid_json", "request body is not valid JSON");
-  }
+  if (!json.ok) throw new HttpError(400, "invalid_json", "request body is not valid JSON");
 
-  const parsed = schema.safeParse(value);
+  const parsed = schema.safeParse(json.value);
 
   if (!parsed.success) {
     const issue = parsed.error.issues[0];
@@ -240,12 +244,6 @@ function stringField(key: string, maxLength: number): z.ZodString {
   return z.string({ error: message }).max(maxLength, message).trim().min(1, message);
 }
 
-function boundedInteger(value: string, fallback: number, minimum: number, maximum: number): number {
-  const parsed = Number.parseInt(value, 10);
-
-  return Number.isFinite(parsed) && parsed >= minimum && parsed <= maximum ? parsed : fallback;
-}
-
 type JsonResponseBody =
   | MutationResult
   | { error: { code: string; message: string } }
@@ -258,7 +256,11 @@ function json(value: JsonResponseBody, status = 200): Response {
   });
 }
 
-function jsonText(value: string, status = 200): Response {
+// Sends a broker response as-is. The response body is the JSON text of `T`.
+function jsonText<T extends JsonResponseBody | QueueFile>(
+  value: Encoded<T>,
+  status = 200,
+): Response {
   return new Response(value, {
     status,
     headers: {

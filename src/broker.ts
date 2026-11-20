@@ -1,12 +1,28 @@
 import { DurableObject } from "cloudflare:workers";
+import { parseConfig, type Config } from "./config";
 import {
-  applyBatch,
+  currentInstant,
+  newJobId,
+  newLeaseToken,
+  type IdempotencyKey,
+  type JobId,
+  type LeaseToken,
+  type JsonValue,
+  type QueueName,
+  type WorkerId,
+} from "./domain";
+import { decode, encode, type Encoded } from "./rpc";
+import {
+  applyMutation,
+  closeDraft,
   emptyQueue,
+  openDraft,
   parseQueueFile,
-  JsonValueSchema,
-  type MutationResult,
+  type MutationKind,
+  type MutationOf,
+  type QueueDraft,
   type QueueFile,
-  type QueueMutation,
+  type ResultOf,
 } from "./model";
 
 interface Snapshot {
@@ -14,94 +30,104 @@ interface Snapshot {
   etag: string | null;
 }
 
-interface PendingMutation {
-  mutation: QueueMutation;
-  resolve: (result: MutationResult) => void;
-  reject: (cause: unknown) => void;
+// A queued mutation, erased to a uniform type so different kinds can share one
+// batch. `apply` runs the mutation against a draft and returns the callback
+// that delivers its typed result; the result type never leaves the closure.
+interface PendingCommand {
+  apply: (draft: QueueDraft) => () => void;
+  fail: (cause: Error) => void;
 }
 
+const MAX_COMMIT_ATTEMPTS = 5;
+
 export class QueueBroker extends DurableObject<Env> {
+  private readonly config: Config;
   private snapshot: Snapshot | undefined;
-  private queueName: string | undefined;
-  private pending: PendingMutation[] = [];
+  private queueName: QueueName | undefined;
+  private pending: PendingCommand[] = [];
   private flushPromise: Promise<void> | undefined;
 
-  async push(queue: string, payloadJson: string, idempotencyKey?: string): Promise<string> {
-    this.bindQueue(queue);
-
-    const mutation: Extract<QueueMutation, { kind: "push" }> = {
-      kind: "push",
-      id: crypto.randomUUID(),
-      payload: JsonValueSchema.parse(JSON.parse(payloadJson)),
-      now: new Date().toISOString(),
-    };
-
-    if (idempotencyKey) mutation.idempotencyKey = idempotencyKey;
-    const result = await this.enqueue(mutation);
-
-    if (result.kind !== "push") throw new Error("broker returned the wrong mutation result");
-
-    return JSON.stringify(result);
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, env);
+    this.config = parseConfig(env);
   }
 
-  async claim(queue: string, workerId: string, maxJobs: number): Promise<string> {
+  async push(
+    queue: QueueName,
+    payload: Encoded<JsonValue>,
+    idempotencyKey: IdempotencyKey | undefined,
+  ): Promise<Encoded<ResultOf<"push">>> {
     this.bindQueue(queue);
 
-    const result = await this.enqueue({
-      kind: "claim",
-      workerId,
-      maxJobs,
-      leaseTokens: Array.from({ length: maxJobs }, () => crypto.randomUUID()),
-      leaseSeconds: this.integerSetting("QUEUE_LEASE_SECONDS", 60, 1, 86_400),
-      now: new Date().toISOString(),
-    });
-
-    if (result.kind !== "claim") throw new Error("broker returned the wrong mutation result");
-
-    return JSON.stringify(result);
+    return encode(
+      await this.enqueue({
+        kind: "push",
+        id: newJobId(),
+        idempotencyKey,
+        payload: decode(payload),
+        now: currentInstant(),
+      }),
+    );
   }
 
-  async heartbeat(queue: string, jobId: string, leaseToken: string): Promise<string> {
+  async claim(
+    queue: QueueName,
+    workerId: WorkerId,
+    maxJobs: number,
+  ): Promise<Encoded<ResultOf<"claim">>> {
     this.bindQueue(queue);
 
-    const result = await this.enqueue({
-      kind: "heartbeat",
-      jobId,
-      leaseToken,
-      leaseSeconds: this.integerSetting("QUEUE_LEASE_SECONDS", 60, 1, 86_400),
-      now: new Date().toISOString(),
-    });
-
-    if (result.kind !== "heartbeat") throw new Error("broker returned the wrong mutation result");
-
-    return JSON.stringify(result);
+    return encode(
+      await this.enqueue({
+        kind: "claim",
+        workerId,
+        maxJobs,
+        leaseSeconds: this.config.leaseSeconds,
+        now: currentInstant(),
+      }),
+    );
   }
 
-  async complete(queue: string, jobId: string, leaseToken: string): Promise<string> {
+  async heartbeat(
+    queue: QueueName,
+    jobId: JobId,
+    leaseToken: LeaseToken,
+  ): Promise<Encoded<ResultOf<"heartbeat">>> {
     this.bindQueue(queue);
 
-    const result = await this.enqueue({
-      kind: "complete",
-      jobId,
-      leaseToken,
-      now: new Date().toISOString(),
-    });
-
-    if (result.kind !== "complete") throw new Error("broker returned the wrong mutation result");
-
-    return JSON.stringify(result);
+    return encode(
+      await this.enqueue({
+        kind: "heartbeat",
+        jobId,
+        leaseToken,
+        leaseSeconds: this.config.leaseSeconds,
+        now: currentInstant(),
+      }),
+    );
   }
 
-  async inspect(queue: string): Promise<string> {
+  async complete(
+    queue: QueueName,
+    jobId: JobId,
+    leaseToken: LeaseToken,
+  ): Promise<Encoded<ResultOf<"complete">>> {
+    this.bindQueue(queue);
+
+    return encode(
+      await this.enqueue({ kind: "complete", jobId, leaseToken, now: currentInstant() }),
+    );
+  }
+
+  async inspect(queue: QueueName): Promise<Encoded<QueueFile>> {
     this.bindQueue(queue);
 
     if (this.flushPromise) await this.flushPromise;
     const snapshot = await this.load(queue, true);
 
-    return JSON.stringify(snapshot.file);
+    return encode(snapshot.file);
   }
 
-  private bindQueue(queue: string): void {
+  private bindQueue(queue: QueueName): void {
     if (this.queueName && this.queueName !== queue) {
       throw new Error("Durable Object received operations for two queue names");
     }
@@ -109,9 +135,16 @@ export class QueueBroker extends DurableObject<Env> {
     this.queueName = queue;
   }
 
-  private enqueue(mutation: QueueMutation): Promise<MutationResult> {
-    const result = new Promise<MutationResult>((resolve, reject) => {
-      this.pending.push({ mutation, resolve, reject });
+  private enqueue<K extends MutationKind>(mutation: MutationOf<K>): Promise<ResultOf<K>> {
+    const result = new Promise<ResultOf<K>>((resolve, reject) => {
+      this.pending.push({
+        apply: (draft) => {
+          const outcome = applyMutation(draft, mutation);
+
+          return () => resolve(outcome);
+        },
+        fail: reject,
+      });
     });
 
     if (!this.flushPromise) {
@@ -125,98 +158,78 @@ export class QueueBroker extends DurableObject<Env> {
   }
 
   private async flushLoop(): Promise<void> {
-    await delay(this.integerSetting("QUEUE_BATCH_WINDOW_MS", 5, 0, 1_000));
+    await delay(this.config.batchWindowMs);
 
     while (this.pending.length > 0) {
       const batch = this.pending.splice(0);
 
       try {
-        const results = await this.commit(batch.map((item) => item.mutation));
-        batch.forEach((item, index) => {
-          const result = results[index];
+        const deliveries = await this.commit(batch);
 
-          if (result) item.resolve(result);
-          else item.reject(new Error("broker returned an incomplete commit result"));
-        });
+        for (const deliver of deliveries) deliver();
       } catch (error) {
-        for (const item of batch) item.reject(error);
+        const cause = error instanceof Error ? error : new Error(String(error));
+
+        for (const command of batch) command.fail(cause);
       }
     }
   }
 
-  private async commit(mutations: QueueMutation[]): Promise<MutationResult[]> {
+  // Applies the batch to the latest snapshot and writes it with an R2
+  // compare-and-set. Results are delivered only after R2 accepts the write.
+  private async commit(batch: readonly PendingCommand[]): Promise<Array<() => void>> {
     const queue = this.queueName;
 
     if (!queue) throw new Error("queue broker is not initialized");
 
-    for (let attempt = 0; attempt < 5; attempt += 1) {
+    for (let attempt = 0; attempt < MAX_COMMIT_ATTEMPTS; attempt += 1) {
       const snapshot = await this.load(queue, attempt > 0);
-      const applied = applyBatch(snapshot.file, mutations);
+      const draft = openDraft(snapshot.file, newLeaseToken);
+      const deliveries = batch.map((command) => command.apply(draft));
+      const { file, changed } = closeDraft(draft);
 
-      if (!applied.changed) return applied.results;
+      if (!changed) return deliveries;
 
-      const body = JSON.stringify(applied.file);
+      const body = JSON.stringify(file);
 
-      const maxBytes = this.integerSetting(
-        "MAX_QUEUE_BYTES",
-        8 * 1024 * 1024,
-        1_024,
-        32 * 1024 * 1024,
-      );
-
-      if (new TextEncoder().encode(body).byteLength > maxBytes) {
-        throw new Error(`queue exceeds configured MAX_QUEUE_BYTES of ${maxBytes}`);
+      if (new TextEncoder().encode(body).byteLength > this.config.maxQueueBytes) {
+        throw new Error(`queue exceeds configured MAX_QUEUE_BYTES of ${this.config.maxQueueBytes}`);
       }
 
-      const stored = await this.env.QUEUE_BUCKET.put(this.objectKey(queue), body, {
+      const stored = await this.env.QUEUE_BUCKET.put(objectKey(queue), body, {
         onlyIf: snapshot.etag ? { etagMatches: snapshot.etag } : { etagDoesNotMatch: "*" },
         httpMetadata: { contentType: "application/json" },
       });
 
       if (stored) {
-        this.snapshot = { file: applied.file, etag: stored.etag };
+        this.snapshot = { file, etag: stored.etag };
 
-        return applied.results;
+        return deliveries;
       }
 
       this.snapshot = undefined;
     }
 
-    throw new Error("R2 compare-and-set failed after 5 attempts");
+    throw new Error(`R2 compare-and-set failed after ${MAX_COMMIT_ATTEMPTS} attempts`);
   }
 
-  private async load(queue: string, force = false): Promise<Snapshot> {
+  private async load(queue: QueueName, force: boolean): Promise<Snapshot> {
     if (this.snapshot && !force) return this.snapshot;
 
-    const object = await this.env.QUEUE_BUCKET.get(this.objectKey(queue));
+    const object = await this.env.QUEUE_BUCKET.get(objectKey(queue));
 
-    if (!object) {
-      const snapshot = { file: emptyQueue(queue, new Date().toISOString()), etag: null };
-      this.snapshot = snapshot;
+    const snapshot: Snapshot = object
+      ? { file: parseQueueFile(await object.text(), queue), etag: object.etag }
+      : { file: emptyQueue(queue, currentInstant()), etag: null };
 
-      return snapshot;
-    }
-
-    const snapshot = { file: parseQueueFile(await object.text(), queue), etag: object.etag };
     this.snapshot = snapshot;
 
     return snapshot;
   }
+}
 
-  private objectKey(queue: string): string {
-    return `queues/${encodeURIComponent(queue)}/queue.json`;
-  }
-
-  private integerSetting(
-    name: "QUEUE_BATCH_WINDOW_MS" | "QUEUE_LEASE_SECONDS" | "MAX_QUEUE_BYTES",
-    fallback: number,
-    minimum: number,
-    maximum: number,
-  ): number {
-    const parsed = Number.parseInt(this.env[name], 10);
-
-    return Number.isFinite(parsed) && parsed >= minimum && parsed <= maximum ? parsed : fallback;
-  }
+function objectKey(queue: QueueName): string {
+  return `queues/${encodeURIComponent(queue)}/queue.json`;
 }
 
 function delay(milliseconds: number): Promise<void> {
