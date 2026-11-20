@@ -354,6 +354,10 @@ export class Broker extends Context.Service<
         batch: readonly PendingCommand[],
         unconfirmed: Map<CommitId, readonly Effect.Effect<void>[]>,
       ) {
+        // Waiting before applying keeps a retry from stamping leases with a
+        // time that the wait in `pacedPut` would then eat into.
+        yield* waitForTurn;
+
         const snapshot = yield* load(queue, false);
         const landed = snapshot.file.commitId && unconfirmed.get(snapshot.file.commitId);
 

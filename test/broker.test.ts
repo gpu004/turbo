@@ -444,4 +444,50 @@ describe("queue broker", () => {
       Exit.succeed([expect.objectContaining({ ok: true }), expect.any(Overloaded)]),
     );
   });
+
+  it("starts a retried claim's lease after the retry waits for its write", async () => {
+    let puts = 0;
+
+    const store = memoryStore((write) => {
+      puts += 1;
+
+      if (puts !== 2) return;
+
+      write({
+        ...emptyQueue(Q, NOW),
+        revision: 5,
+        jobs: [
+          {
+            id: JobId.make("other"),
+            payload: null,
+            enqueuedAt: NOW,
+            attempts: 0,
+            state: "pending",
+          },
+        ],
+      });
+    });
+
+    const exit = await runBroker(
+      store,
+      Broker.use(
+        Effect.fn(function* (broker) {
+          yield* broker.push(Q, { n: 1 }, undefined);
+
+          const requested = yield* currentInstant;
+          const [job] = (yield* broker.claim(Q, WorkerId.make("w"), 1)).jobs;
+
+          return { requested, heartbeatAt: job?.lease.heartbeatAt };
+        }),
+      ),
+      { QUEUE_COMMIT_INTERVAL_MS: "300" },
+    );
+
+    if (!Exit.isSuccess(exit) || !exit.value.heartbeatAt) throw new Error("claim failed");
+
+    const { requested, heartbeatAt } = exit.value;
+
+    expect(store.puts()).toBe(3);
+    expect(isAtOrAfter(heartbeatAt, addSeconds(requested, 0.55))).toBe(true);
+  });
 });
