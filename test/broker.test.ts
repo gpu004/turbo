@@ -11,10 +11,13 @@ import {
 } from "../src/broker";
 import { Settings, type SettingsEnv } from "../src/config";
 import {
+  addSeconds,
   CommitId,
+  currentInstant,
   IdempotencyKey,
   Ids,
   Instant,
+  isAtOrAfter,
   JobId,
   LeaseToken,
   QueueName,
@@ -393,5 +396,52 @@ describe("queue broker", () => {
       Exit.succeed([expect.objectContaining({ ok: true }), expect.any(Overloaded)]),
     );
     expect(store.file()?.jobs).toHaveLength(1);
+  });
+
+  it("starts a lease when its commit is written, not when the claim arrived", async () => {
+    const store = memoryStore();
+
+    const exit = await runBroker(
+      store,
+      Broker.use(
+        Effect.fn(function* (broker) {
+          yield* broker.push(Q, { n: 1 }, undefined);
+
+          const requested = yield* currentInstant;
+          const [job] = (yield* broker.claim(Q, WorkerId.make("w"), 1)).jobs;
+
+          return { requested, heartbeatAt: job?.lease.heartbeatAt };
+        }),
+      ),
+      { QUEUE_COMMIT_INTERVAL_MS: "300" },
+    );
+
+    if (!Exit.isSuccess(exit) || !exit.value.heartbeatAt) throw new Error("claim failed");
+
+    const { requested, heartbeatAt } = exit.value;
+
+    expect(isAtOrAfter(heartbeatAt, addSeconds(requested, 0.25))).toBe(true);
+  });
+
+  it("refuses pushes once MAX_QUEUE_BYTES of payloads are waiting", async () => {
+    const store = memoryStore();
+
+    const exit = await runBroker(
+      store,
+      Broker.use((broker) =>
+        Effect.all(
+          [
+            broker.push(Q, "x".repeat(600), undefined),
+            Effect.flip(broker.push(Q, "y".repeat(600), undefined)),
+          ],
+          { concurrency: "unbounded" },
+        ),
+      ),
+      { MAX_QUEUE_BYTES: "1024" },
+    );
+
+    expect(exit).toEqual(
+      Exit.succeed([expect.objectContaining({ ok: true }), expect.any(Overloaded)]),
+    );
   });
 });

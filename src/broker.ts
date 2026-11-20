@@ -20,6 +20,7 @@ import {
   Ids,
   type CommitId,
   type IdempotencyKey,
+  type Instant,
   type JobId,
   type JsonValue,
   type LeaseToken,
@@ -182,13 +183,20 @@ interface Snapshot {
 // A queued mutation, erased to a uniform type so different kinds can share one
 // batch. `apply` runs the mutation against a draft and returns the effect that
 // delivers its typed result; the result type never leaves the closure.
+//
+// `now` is the time of the commit attempt, not of the request. A command can
+// wait a commit interval or more before it is applied, and a lease must start
+// when it is written.
 interface PendingCommand {
-  readonly apply: (draft: QueueDraft) => Effect.Effect<void>;
+  readonly apply: (draft: QueueDraft, now: Instant) => Effect.Effect<void>;
   readonly fail: (cause: Cause.Cause<CommitError>) => Effect.Effect<void>;
+  // Payload bytes this command holds in memory until it commits.
+  readonly bytes: number;
 }
 
 interface FlushState {
   readonly pending: readonly PendingCommand[];
+  readonly pendingBytes: number;
   // Completes when the running flush loop has drained `pending`. Absent when
   // no loop is running.
   readonly idle: Deferred.Deferred<void> | undefined;
@@ -241,7 +249,7 @@ export class Broker extends Context.Service<
       const boundQueue = yield* Ref.make(Option.none<QueueName>());
       const snapshotRef = yield* Ref.make(Option.none<Snapshot>());
       const lastPutAt = yield* Ref.make(Option.none<number>());
-      const flush = yield* Ref.make<FlushState>({ pending: [], idle: undefined });
+      const flush = yield* Ref.make<FlushState>({ pending: [], pendingBytes: 0, idle: undefined });
 
       const bindQueue = Effect.fn(function* (queue: QueueName) {
         const bound = yield* Ref.modify(boundQueue, (current) =>
@@ -285,11 +293,12 @@ export class Broker extends Context.Service<
         batch: readonly PendingCommand[],
         commitId: CommitId,
       ) {
+        const now = yield* currentInstant;
         let shed: Shedding | undefined;
 
         while (true) {
           const draft = openDraft(snapshot.file, ids.newLeaseToken, shed);
-          const deliveries = batch.map((command) => command.apply(draft));
+          const deliveries = batch.map((command) => command.apply(draft, now));
           const closed = yield* closeDraft(draft);
           const file = closed.changed ? { ...closed.file, commitId } : closed.file;
           const overflow = serializedBytes(file) - settings.maxQueueBytes;
@@ -412,8 +421,8 @@ export class Broker extends Context.Service<
               flush,
               (state): [readonly PendingCommand[], FlushState] =>
                 state.pending.length === 0
-                  ? [state.pending, { pending: [], idle: undefined }]
-                  : [state.pending, { pending: [], idle: state.idle }],
+                  ? [state.pending, { pending: [], pendingBytes: 0, idle: undefined }]
+                  : [state.pending, { pending: [], pendingBytes: 0, idle: state.idle }],
             );
 
             if (batch.length === 0) return;
@@ -434,7 +443,8 @@ export class Broker extends Context.Service<
 
       const enqueue = Effect.fn(function* <K extends MutationKind>(
         queue: QueueName,
-        mutation: MutationOf<K>,
+        mutation: (now: Instant) => MutationOf<K>,
+        bytes = 0,
       ) {
         yield* bindQueue(queue);
 
@@ -442,28 +452,39 @@ export class Broker extends Context.Service<
         const idle = yield* Deferred.make<void>();
 
         const command: PendingCommand = {
-          apply: (draft) => {
-            const outcome = applyMutation(draft, mutation);
+          apply: (draft, now) => {
+            const outcome = applyMutation(draft, mutation(now));
 
             return Deferred.succeed(result, outcome).pipe(Effect.asVoid);
           },
           fail: (cause) => Deferred.failCause(result, cause).pipe(Effect.asVoid),
+          bytes,
         };
 
+        // Waiting payloads beyond MAX_QUEUE_BYTES could not fit in one commit
+        // anyway, and bounding them keeps a burst of large pushes from
+        // exhausting isolate memory.
         const queued = yield* Ref.modify(
           flush,
           (state): ["start" | "joined" | "full", FlushState] => {
-            if (state.pending.length >= settings.maxPendingMutations) return ["full", state];
+            const full =
+              state.pending.length >= settings.maxPendingMutations ||
+              (state.pending.length > 0 && state.pendingBytes + bytes > settings.maxQueueBytes);
+
+            if (full) return ["full", state];
+
+            const pending = [...state.pending, command];
+            const pendingBytes = state.pendingBytes + bytes;
 
             return state.idle === undefined
-              ? ["start", { pending: [command], idle }]
-              : ["joined", { pending: [...state.pending, command], idle: state.idle }];
+              ? ["start", { pending, pendingBytes, idle }]
+              : ["joined", { pending, pendingBytes, idle: state.idle }];
           },
         );
 
         if (queued === "full") {
           return yield* new Overloaded({
-            message: `queue already has ${settings.maxPendingMutations} mutations waiting to commit`,
+            message: "too many mutations are waiting for the next commit",
           });
         }
 
@@ -474,43 +495,44 @@ export class Broker extends Context.Service<
 
       return {
         push: Effect.fn(function* (queue, payload, idempotencyKey) {
-          return yield* enqueue(queue, {
-            kind: "push",
-            id: ids.newJobId(),
-            idempotencyKey,
-            payload,
-            now: yield* currentInstant,
-          });
+          // One id for every attempt, so shedding and recovery see one job.
+          const id = ids.newJobId();
+
+          return yield* enqueue(
+            queue,
+            (now) => ({ kind: "push", id, idempotencyKey, payload, now }),
+            serializedBytes(payload),
+          );
         }),
 
         claim: Effect.fn(function* (queue, workerId, maxJobs) {
-          return yield* enqueue(queue, {
+          return yield* enqueue(queue, (now) => ({
             kind: "claim",
             workerId,
             maxJobs,
             leaseSeconds: settings.leaseSeconds,
-            now: yield* currentInstant,
-          });
+            now,
+          }));
         }),
 
         heartbeat: Effect.fn(function* (queue, jobId, leaseToken) {
-          return yield* enqueue(queue, {
+          return yield* enqueue(queue, (now) => ({
             kind: "heartbeat",
             jobId,
             leaseToken,
             leaseSeconds: settings.leaseSeconds,
-            now: yield* currentInstant,
-          });
+            now,
+          }));
         }),
 
         complete: Effect.fn(function* (queue, jobId, leaseToken) {
-          return yield* enqueue(queue, {
+          return yield* enqueue(queue, (now) => ({
             kind: "complete",
             jobId,
             leaseToken,
             retainSeconds: settings.completedRetentionSeconds,
-            now: yield* currentInstant,
-          });
+            now,
+          }));
         }),
 
         inspect: Effect.fn(function* (queue) {

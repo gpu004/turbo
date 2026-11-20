@@ -554,7 +554,7 @@ export function planShedding(
   return { ...shed, refusedPushes: refused };
 }
 
-export function serializedBytes(value: QueueFile | QueueJob | CompletedJob): number {
+export function serializedBytes(value: QueueFile | QueueJob | CompletedJob | JsonValue): number {
   return new TextEncoder().encode(JSON.stringify(value)).byteLength;
 }
 
