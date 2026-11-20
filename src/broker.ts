@@ -30,13 +30,18 @@ import {
   emptyQueue,
   openDraft,
   parseQueueFile,
+  planShedding,
+  publicQueueFile,
+  serializedBytes,
   type InvariantViolation,
   type MutationKind,
   type MutationOf,
+  type PublicQueueFile,
   type QueueDraft,
   type QueueFile,
   type QueueFileError,
   type ResultOf,
+  type Shedding,
 } from "./model";
 
 export class StorageFailure extends Data.TaggedError("StorageFailure")<{
@@ -184,7 +189,7 @@ export class Broker extends Context.Service<
       jobId: JobId,
       leaseToken: LeaseToken,
     ) => Effect.Effect<ResultOf<"complete">, BrokerError>;
-    readonly inspect: (queue: QueueName) => Effect.Effect<QueueFile, BrokerError>;
+    readonly inspect: (queue: QueueName) => Effect.Effect<PublicQueueFile, BrokerError>;
   }
 >()("turbo/Broker") {
   static readonly layer = Layer.effect(
@@ -231,24 +236,44 @@ export class Broker extends Context.Service<
         return snapshot;
       });
 
+      // Applies the batch to the snapshot until the result fits in
+      // MAX_QUEUE_BYTES, giving up what `planShedding` picks each time it does
+      // not. Every attempt starts again from the snapshot, so only the last
+      // attempt's results are delivered.
+      const applyWithinLimit = Effect.fn(function* (
+        snapshot: Snapshot,
+        batch: readonly PendingCommand[],
+      ) {
+        let shed: Shedding | undefined;
+
+        while (true) {
+          const draft = openDraft(snapshot.file, ids.newLeaseToken, shed);
+          const deliveries = batch.map((command) => command.apply(draft));
+          const closed = yield* closeDraft(draft);
+          const overflow = serializedBytes(closed.file) - settings.maxQueueBytes;
+
+          if (!closed.changed || overflow <= 0) return { ...closed, deliveries };
+
+          shed = planShedding(snapshot.file, closed.file, draft.shed, overflow);
+
+          if (!shed) {
+            return yield* new QueueTooLarge({
+              message: `queue exceeds configured MAX_QUEUE_BYTES of ${settings.maxQueueBytes}`,
+            });
+          }
+        }
+      });
+
       // Applies the batch to the latest snapshot and writes it with an R2
       // compare-and-set. A failed compare-and-set clears the snapshot, so the
       // next attempt reloads from R2.
       const commitOnce = Effect.fn(function* (queue: QueueName, batch: readonly PendingCommand[]) {
         const snapshot = yield* load(queue, false);
-        const draft = openDraft(snapshot.file, ids.newLeaseToken);
-        const deliveries = batch.map((command) => command.apply(draft));
-        const { file, changed } = yield* closeDraft(draft);
+        const { file, changed, deliveries } = yield* applyWithinLimit(snapshot, batch);
 
         if (!changed) return deliveries;
 
         const body = JSON.stringify(file);
-
-        if (new TextEncoder().encode(body).byteLength > settings.maxQueueBytes) {
-          return yield* new QueueTooLarge({
-            message: `queue exceeds configured MAX_QUEUE_BYTES of ${settings.maxQueueBytes}`,
-          });
-        }
 
         const stored = yield* store.put(queue, body, snapshot.etag);
 
@@ -377,6 +402,7 @@ export class Broker extends Context.Service<
             kind: "complete",
             jobId,
             leaseToken,
+            retainSeconds: settings.completedRetentionSeconds,
             now: yield* currentInstant,
           });
         }),
@@ -390,7 +416,7 @@ export class Broker extends Context.Service<
 
           const snapshot = yield* load(queue, true);
 
-          return snapshot.file;
+          return publicQueueFile(snapshot.file);
         }),
       };
     }),
@@ -450,7 +476,7 @@ export class QueueBroker extends DurableObject<Env> {
     return this.run(Broker.use((broker) => broker.complete(queue, jobId, leaseToken)));
   }
 
-  inspect(queue: QueueName): Promise<Encoded<QueueFile>> {
+  inspect(queue: QueueName): Promise<Encoded<PublicQueueFile>> {
     return this.run(Broker.use((broker) => broker.inspect(queue)));
   }
 

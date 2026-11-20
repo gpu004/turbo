@@ -9,6 +9,7 @@ describe("Settings", () => {
       QUEUE_LEASE_SECONDS: "30s",
       MAX_QUEUE_BYTES: "0x800",
       MAX_REQUEST_BYTES: "4096",
+      COMPLETED_RETENTION_SECONDS: "60",
     };
 
     const settings = Effect.runSync(
@@ -20,6 +21,7 @@ describe("Settings", () => {
       leaseSeconds: 30,
       maxQueueBytes: 8 * 1024 * 1024,
       maxRequestBytes: 4096,
+      completedRetentionSeconds: 60,
     });
   });
 });

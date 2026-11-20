@@ -96,6 +96,56 @@ describe("queue Worker", () => {
     expect(first.jobs[0]?.id).not.toBe(second.jobs[0]?.id);
   });
 
+  it("keeps a completed job's idempotency key and fences repeat completions", async () => {
+    const pushed = await post("/queues/retained/jobs", { payload: 1 }, { "idempotency-key": "k" });
+    const { job } = await pushed.json<PushResponse>();
+    const leaseToken = await claimOne("retained");
+
+    const completion = await post(`/queues/retained/jobs/${job.id}/complete`, { leaseToken });
+    expect(completion.status).toBe(200);
+
+    const retry = await post("/queues/retained/jobs", { payload: 1 }, { "idempotency-key": "k" });
+    expect(retry.status).toBe(200);
+    await expect(retry.json()).resolves.toMatchObject({ duplicate: true, jobId: job.id });
+
+    const repeat = await post(`/queues/retained/jobs/${job.id}/complete`, { leaseToken });
+    expect(repeat.status).toBe(200);
+    await expect(repeat.json()).resolves.toMatchObject({ alreadyCompleted: true });
+
+    const forged = await post(`/queues/retained/jobs/${job.id}/complete`, {
+      leaseToken: "forged",
+    });
+
+    expect(forged.status).toBe(409);
+
+    const unknown = await post("/queues/retained/jobs/never-existed/complete", { leaseToken });
+    expect(unknown.status).toBe(404);
+    await expect(unknown.json()).resolves.toMatchObject({ error: { code: "job_not_found" } });
+  });
+
+  it("returns a lease token only to the worker that holds it", async () => {
+    await post("/queues/redacted/jobs", { payload: 1 }, { "idempotency-key": "leased" });
+    const done = await post("/queues/redacted/jobs", { payload: 2 });
+    const doneId = (await done.json<PushResponse>()).job.id;
+
+    const leasedToken = await claimOne("redacted");
+    const doneToken = await claimOne("redacted");
+    await post(`/queues/redacted/jobs/${doneId}/complete`, { leaseToken: doneToken });
+
+    const duplicate = await post(
+      "/queues/redacted/jobs",
+      { payload: 1 },
+      { "idempotency-key": "leased" },
+    );
+
+    const inspected = await exports.default.fetch("https://queue.test/queues/redacted");
+    const text = `${await duplicate.text()}${await inspected.text()}`;
+
+    expect(text).toContain("workerId");
+    expect(text).not.toContain(leasedToken);
+    expect(text).not.toContain(doneToken);
+  });
+
   it("validates request bodies at the JSON boundary", async () => {
     const missingPayload = await post("/queues/validation/jobs", {});
     expect(missingPayload.status).toBe(400);
@@ -141,6 +191,15 @@ function post(
     headers: { "content-type": "application/json", ...headers },
     body: JSON.stringify(body),
   });
+}
+
+async function claimOne(queue: string): Promise<string> {
+  const response = await post(`/queues/${queue}/claims`, { workerId: "worker", maxJobs: 1 });
+  const token = (await response.json<ClaimResponse>()).jobs[0]?.lease?.token;
+
+  if (!token) throw new Error(`claim on ${queue} returned no lease token`);
+
+  return token;
 }
 
 interface PushResponse {

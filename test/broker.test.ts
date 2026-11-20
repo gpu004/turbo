@@ -7,8 +7,16 @@ import {
   QueueStore,
   type StoredQueue,
 } from "../src/broker";
-import { Settings } from "../src/config";
-import { Ids, Instant, JobId, LeaseToken, QueueName } from "../src/domain";
+import { Settings, type SettingsEnv } from "../src/config";
+import {
+  IdempotencyKey,
+  Ids,
+  Instant,
+  JobId,
+  LeaseToken,
+  QueueName,
+  WorkerId,
+} from "../src/domain";
 import { emptyQueue, parseQueueFile, type QueueFile } from "../src/model";
 
 // The commit protocol in src/broker.ts against an in-memory R2 object with the
@@ -91,9 +99,10 @@ const forkedBackground = Layer.succeed(Background, {
 function runBroker<A, E>(
   store: MemoryStore,
   program: Effect.Effect<A, E, Broker>,
+  env: SettingsEnv = {},
 ): Promise<Exit.Exit<A, E>> {
   const services = Layer.mergeAll(
-    Settings.fromEnv({ QUEUE_BATCH_WINDOW_MS: "20" }),
+    Settings.fromEnv({ QUEUE_BATCH_WINDOW_MS: "20", ...env }),
     sequentialIds(),
     store.layer,
     forkedBackground,
@@ -183,5 +192,75 @@ describe("queue broker", () => {
     expect(exit).toEqual(
       Exit.succeed([expect.any(CommitAttemptsExhausted), expect.any(CommitAttemptsExhausted)]),
     );
+  });
+
+  it("refuses only the pushes that do not fit and commits the rest of the batch", async () => {
+    const store = memoryStore();
+    const tiny = { MAX_QUEUE_BYTES: "1024" };
+
+    const exit = await runBroker(
+      store,
+      Broker.use((broker) =>
+        Effect.all(
+          [
+            broker.push(Q, { n: 1 }, undefined),
+            broker.push(Q, "x".repeat(900), undefined),
+            broker.push(Q, { n: 3 }, undefined),
+          ],
+          { concurrency: "unbounded" },
+        ),
+      ),
+      tiny,
+    );
+
+    expect(exit).toEqual(
+      Exit.succeed([
+        expect.objectContaining({ ok: true, duplicate: false }),
+        expect.objectContaining({ ok: false, code: "queue_full" }),
+        expect.objectContaining({ ok: true, duplicate: false }),
+      ]),
+    );
+    expect(store.puts()).toBe(1);
+    expect(store.file()?.jobs.map((job) => job.payload)).toEqual([{ n: 1 }, { n: 3 }]);
+  });
+
+  it("evicts the oldest completed jobs to make room for new work", async () => {
+    const store = memoryStore();
+    const tiny = { MAX_QUEUE_BYTES: "1024" };
+
+    const fill = Broker.use(
+      Effect.fn(function* (broker) {
+        for (let n = 0; n < 4; n += 1) {
+          yield* broker.push(Q, { n }, IdempotencyKey.make(`key-${n}`));
+
+          const [job] = (yield* broker.claim(Q, WorkerId.make("w"), 1)).jobs;
+
+          if (!job) throw new Error("expected a claimed job");
+          yield* broker.complete(Q, job.id, job.lease.token);
+        }
+
+        const retained = (yield* broker.inspect(Q)).completed?.length;
+        const pushed = yield* broker.push(Q, "x".repeat(400), undefined);
+        const claimed = yield* broker.claim(Q, WorkerId.make("w"), 1);
+
+        return { retained, pushed, claimed };
+      }),
+    );
+
+    const exit = await runBroker(store, fill, tiny);
+
+    expect(exit).toEqual(
+      Exit.succeed({
+        retained: 4,
+        pushed: expect.objectContaining({ ok: true, duplicate: false }),
+        claimed: expect.objectContaining({ jobs: [expect.anything()] }),
+      }),
+    );
+
+    const completed = store.file()?.completed?.map((job) => job.idempotencyKey) ?? [];
+
+    expect(completed.length).toBeGreaterThan(0);
+    expect(completed.length).toBeLessThan(4);
+    expect(completed).toEqual(["key-0", "key-1", "key-2", "key-3"].slice(4 - completed.length));
   });
 });

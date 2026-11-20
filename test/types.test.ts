@@ -1,7 +1,15 @@
 import { Effect } from "effect";
 import { describe, expectTypeOf, it } from "vitest";
 import { Instant, JobId, LeaseToken, QueueName, WorkerId } from "../src/domain";
-import { applyMutation, emptyQueue, openDraft, type LeasedJob, type QueueJob } from "../src/model";
+import {
+  applyMutation,
+  emptyQueue,
+  openDraft,
+  publicJob,
+  type LeasedJob,
+  type PublicJob,
+  type QueueJob,
+} from "../src/model";
 import { route } from "../src/router";
 
 // Each `@ts-expect-error` below is a mistake the types must reject. If one ever
@@ -58,6 +66,24 @@ describe("compile-time guarantees", () => {
     pending.attempts = 1;
 
     expectTypeOf(leaseless).toEqualTypeOf<QueueJob>();
+  });
+
+  it("keeps a lease token out of a job shown to anyone but its holder", () => {
+    const leased: LeasedJob = {
+      id: jobId,
+      payload: null,
+      enqueuedAt: now,
+      attempts: 1,
+      state: "leased",
+      lease: { token, workerId: WorkerId.make("w"), heartbeatAt: now, expiresAt: now },
+    };
+
+    // @ts-expect-error a leased job still carries its token
+    const leaked: PublicJob = leased;
+
+    const shown: PublicJob = publicJob(leased);
+
+    expectTypeOf(leaked).toEqualTypeOf(shown);
   });
 
   it("only exposes route params the pattern captures", () => {

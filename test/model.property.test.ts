@@ -14,6 +14,7 @@ import {
 import {
   applyBatch,
   emptyQueue,
+  publicQueueFile,
   type MutationResult,
   type QueueFile,
   type QueueJob,
@@ -26,6 +27,9 @@ import {
 const BASE = Instant.make("2026-08-31T12:00:00.000Z");
 
 const LEASE_SECONDS = 30;
+
+// Short enough that workloads see completed jobs expire.
+const RETAIN_SECONDS = 40;
 
 const QUEUE = QueueName.make("property");
 
@@ -107,6 +111,28 @@ describe("queue model properties", () => {
     );
   });
 
+  it("enqueues a key again only once its job has completed and the retention has passed", () => {
+    fc.assert(
+      fc.property(workloadArbitrary, (intents) => {
+        checkIdempotency(runSequentially(intents).steps);
+      }),
+    );
+  });
+
+  it("returns lease tokens only from claims and heartbeats", () => {
+    fc.assert(
+      fc.property(workloadArbitrary, (intents) => {
+        const leaked = runSequentially(intents).steps.flatMap(({ after, result }) =>
+          result.kind === "claim" || result.kind === "heartbeat"
+            ? [JSON.stringify(publicQueueFile(after))]
+            : [JSON.stringify(result), JSON.stringify(publicQueueFile(after))],
+        );
+
+        for (const text of leaked) expect(text).not.toMatch(/token-\d/);
+      }),
+    );
+  });
+
   it("gives the same results as one group commit and as one mutation at a time", () => {
     fc.assert(
       fc.property(workloadArbitrary, (intents) => {
@@ -120,6 +146,7 @@ describe("queue model properties", () => {
 
         expect(batch.results).toEqual(sequential.steps.map((step) => step.result));
         expect(batch.file.jobs).toEqual(last?.jobs);
+        expect(batch.file.completed).toEqual(last?.completed);
         expect(batch.file.revision).toBe(batch.changed ? 1 : 0);
       }),
     );
@@ -144,7 +171,7 @@ function runSequentially(intents: readonly Intent[]): Run {
 
     if (!result) throw new Error("applyBatch returned no result for a single mutation");
 
-    if (result.kind === "push" && !result.duplicate) jobIds.push(result.job.id);
+    if (result.kind === "push" && result.ok && !result.duplicate) jobIds.push(result.job.id);
 
     if (result.kind === "claim") tokens.push(...result.jobs.map((job) => job.lease.token));
 
@@ -189,7 +216,7 @@ function toMutation(
 
       return intent.kind === "heartbeat"
         ? { kind: "heartbeat", jobId, leaseToken, leaseSeconds: LEASE_SECONDS, now }
-        : { kind: "complete", jobId, leaseToken, now };
+        : { kind: "complete", jobId, leaseToken, retainSeconds: RETAIN_SECONDS, now };
     }
   }
 }
@@ -229,8 +256,18 @@ function checkFencing({ before, mutation, result }: Step): void {
     job.lease.token === mutation.leaseToken &&
     !isAtOrAfter(mutation.now, job.lease.expiresAt);
 
-  if (result.kind === "complete" && result.ok && result.alreadyCompleted) {
-    expect(job).toBeUndefined();
+  if (!job && mutation.kind === "complete") {
+    const completed = before.completed?.find(
+      (candidate) =>
+        candidate.jobId === mutation.jobId && !isAtOrAfter(mutation.now, candidate.expiresAt),
+    );
+
+    expect(result.ok).toBe(completed?.leaseToken === mutation.leaseToken);
+    expect(result).toMatchObject(
+      result.ok
+        ? { alreadyCompleted: true }
+        : { code: completed ? "lease_mismatch" : "job_not_found" },
+    );
 
     return;
   }
@@ -249,7 +286,7 @@ function checkFifoClaim({ before, mutation, result }: Step): void {
 function checkConservation({ before, mutation, result, after }: Step): void {
   const expected = before.jobs.map((job) => job.id);
 
-  if (result.kind === "push" && !result.duplicate) expected.push(result.job.id);
+  if (result.kind === "push" && result.ok && !result.duplicate) expected.push(result.job.id);
 
   if (result.kind === "complete" && result.ok && !result.alreadyCompleted) {
     expected.splice(expected.indexOf(result.jobId), 1);
@@ -257,6 +294,39 @@ function checkConservation({ before, mutation, result, after }: Step): void {
 
   expect(after.jobs.map((job) => job.id)).toEqual(expected);
   expect(mutation.kind === "complete" || after.jobs.length >= before.jobs.length).toBe(true);
+}
+
+// Replays the workload's history of each idempotency key, independently of
+// how the model stores completed jobs.
+function checkIdempotency(steps: readonly Step[]): void {
+  const history = new Map<string, { jobId: JobId; completedAt: Instant | undefined }>();
+
+  for (const { mutation, result } of steps) {
+    if (mutation.kind === "complete" && result.kind === "complete" && result.ok) {
+      for (const entry of history.values()) {
+        if (entry.jobId === result.jobId && !entry.completedAt) entry.completedAt = mutation.now;
+      }
+    }
+
+    if (mutation.kind !== "push" || result.kind !== "push" || !mutation.idempotencyKey) continue;
+
+    const previous = history.get(mutation.idempotencyKey);
+
+    const retained =
+      previous !== undefined &&
+      (previous.completedAt === undefined ||
+        !isAtOrAfter(mutation.now, addSeconds(previous.completedAt, RETAIN_SECONDS)));
+
+    expect(result).toMatchObject({ ok: true, duplicate: retained });
+
+    if (retained) {
+      const jobId = "job" in result ? result.job.id : "jobId" in result ? result.jobId : undefined;
+
+      expect(jobId).toBe(previous.jobId);
+    } else if (result.ok && "job" in result) {
+      history.set(mutation.idempotencyKey, { jobId: result.job.id, completedAt: undefined });
+    }
+  }
 }
 
 function isClaimable(job: QueueJob, now: Instant): boolean {

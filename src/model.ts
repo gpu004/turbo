@@ -40,6 +40,29 @@ export interface LeasedJob extends JobFields {
 
 export type QueueJob = PendingJob | LeasedJob;
 
+// What anyone but the lease holder may see of a job. `token?: never` makes
+// handing a `LeasedJob` to a caller who did not claim it a type error.
+export interface PublicLease {
+  readonly workerId: WorkerId;
+  readonly heartbeatAt: Instant;
+  readonly expiresAt: Instant;
+  readonly token?: never;
+}
+
+export type PublicJob = PendingJob | (Omit<LeasedJob, "lease"> & { readonly lease: PublicLease });
+
+// A completed job, kept until `expiresAt` so a retried push with the same
+// idempotency key, or a repeated completion, is recognised.
+export interface CompletedJob {
+  readonly jobId: JobId;
+  readonly leaseToken: LeaseToken;
+  readonly idempotencyKey?: IdempotencyKey;
+  readonly completedAt: Instant;
+  readonly expiresAt: Instant;
+}
+
+export type PublicCompletedJob = Omit<CompletedJob, "leaseToken"> & { readonly leaseToken?: never };
+
 export interface QueueFile {
   readonly version: 1;
   readonly queue: QueueName;
@@ -50,6 +73,13 @@ export interface QueueFile {
   readonly revision: number;
   readonly updatedAt: Instant;
   readonly jobs: readonly QueueJob[];
+  // Absent in files written before completed jobs were kept.
+  readonly completed?: readonly CompletedJob[];
+}
+
+export interface PublicQueueFile extends Omit<QueueFile, "jobs" | "completed"> {
+  readonly jobs: readonly PublicJob[];
+  readonly completed?: readonly PublicCompletedJob[];
 }
 
 // Stored objects keep fields this version does not know about, so a broker
@@ -78,6 +108,14 @@ const QueueJobSchema = Schema.Union([
   storedStruct({ ...jobFields, state: Schema.Literal("leased"), lease: LeaseSchema }),
 ]);
 
+const CompletedJobSchema = storedStruct({
+  jobId: JobId,
+  leaseToken: LeaseToken,
+  idempotencyKey: Schema.optionalKey(IdempotencyKey),
+  completedAt: Instant,
+  expiresAt: Instant,
+});
+
 const QueueFileSchema: Schema.Decoder<QueueFile> = storedStruct({
   version: Schema.Literal(1),
   queue: QueueName,
@@ -88,7 +126,8 @@ const QueueFileSchema: Schema.Decoder<QueueFile> = storedStruct({
   revision: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
   updatedAt: Instant,
   jobs: Schema.Array(QueueJobSchema),
-}).check(Schema.makeFilter((file) => invariantViolation(file.jobs)));
+  completed: Schema.optionalKey(Schema.Array(CompletedJobSchema)),
+}).check(Schema.makeFilter((file) => invariantViolation(file.jobs, file.completed)));
 
 // Only the identity fields, so a file for another queue or format version is
 // reported as incompatible rather than malformed.
@@ -114,7 +153,10 @@ export class InvariantViolation extends Data.TaggedError("InvariantViolation")<{
 // Invariants the types cannot express. They are checked when a queue is
 // loaded from R2 and again in `closeDraft`, before a file can be written, so a
 // model bug fails the commit instead of persisting a corrupt queue.
-export function invariantViolation(jobs: readonly QueueJob[]): string | undefined {
+export function invariantViolation(
+  jobs: readonly QueueJob[],
+  completed: readonly CompletedJob[] = [],
+): string | undefined {
   const ids = new Set<JobId>();
   const keys = new Set<IdempotencyKey>();
   const tokens = new Set<LeaseToken>();
@@ -146,6 +188,19 @@ export function invariantViolation(jobs: readonly QueueJob[]): string | undefine
     tokens.add(job.lease.token);
   }
 
+  for (const job of completed) {
+    if (ids.has(job.jobId)) return `job ${job.jobId} is both queued and completed`;
+    ids.add(job.jobId);
+
+    if (job.idempotencyKey !== undefined) {
+      if (keys.has(job.idempotencyKey)) {
+        return `idempotency key ${job.idempotencyKey} is used by two jobs`;
+      }
+
+      keys.add(job.idempotencyKey);
+    }
+  }
+
   return undefined;
 }
 
@@ -174,6 +229,7 @@ interface MutationInputs {
   complete: {
     jobId: JobId;
     leaseToken: LeaseToken;
+    retainSeconds: number;
     now: Instant;
   };
 }
@@ -186,8 +242,22 @@ export interface LeaseFailure {
   readonly message: string;
 }
 
+export interface QueueFull {
+  readonly ok: false;
+  readonly code: "queue_full";
+  readonly message: string;
+}
+
 interface MutationOutputs {
-  push: { readonly ok: true; readonly job: QueueJob; readonly duplicate: boolean };
+  push:
+    | { readonly ok: true; readonly job: PublicJob; readonly duplicate: boolean }
+    | {
+        readonly ok: true;
+        readonly duplicate: true;
+        readonly jobId: JobId;
+        readonly completedAt: Instant;
+      }
+    | QueueFull;
   claim: { readonly ok: true; readonly jobs: readonly LeasedJob[] };
   heartbeat: { readonly ok: true; readonly job: LeasedJob } | LeaseFailure;
   complete:
@@ -215,9 +285,20 @@ export type MutationResult = ResultOf;
 export interface QueueDraft {
   readonly source: QueueFile;
   readonly jobs: QueueJob[];
+  readonly completed: CompletedJob[];
   readonly newLeaseToken: () => LeaseToken;
+  readonly shed: Shedding;
   changedAt: Instant | undefined;
 }
+
+// What a commit gives up to fit within MAX_QUEUE_BYTES: pushes refused with
+// `queue_full`, by job id, and how many of the oldest completed jobs to drop.
+export interface Shedding {
+  readonly refusedPushes: ReadonlySet<JobId>;
+  readonly evictedCompleted: number;
+}
+
+const noShedding: Shedding = { refusedPushes: new Set(), evictedCompleted: 0 };
 
 type Handlers = {
   [K in MutationKind]: (draft: QueueDraft, mutation: MutationOf<K>) => ResultOf<K>;
@@ -230,7 +311,36 @@ const handlers: Handlers = {
         ? undefined
         : draft.jobs.find((job) => job.idempotencyKey === mutation.idempotencyKey);
 
-    if (existing) return { ok: true, kind: "push", job: existing, duplicate: true };
+    if (existing) return { ok: true, kind: "push", job: publicJob(existing), duplicate: true };
+
+    const completedIndex =
+      mutation.idempotencyKey === undefined
+        ? -1
+        : draft.completed.findIndex((job) => job.idempotencyKey === mutation.idempotencyKey);
+
+    const completed = draft.completed[completedIndex];
+
+    if (completed && !isAtOrAfter(mutation.now, completed.expiresAt)) {
+      return {
+        ok: true,
+        kind: "push",
+        duplicate: true,
+        jobId: completed.jobId,
+        completedAt: completed.completedAt,
+      };
+    }
+
+    if (draft.shed.refusedPushes.has(mutation.id)) {
+      return {
+        ok: false,
+        kind: "push",
+        code: "queue_full",
+        message: "queue exceeds configured MAX_QUEUE_BYTES",
+      };
+    }
+
+    // The key's completed job has expired, so the key is free again.
+    if (completed) draft.completed.splice(completedIndex, 1);
 
     const fields: PendingJob = {
       id: mutation.id,
@@ -301,13 +411,25 @@ const handlers: Handlers = {
 
   complete(draft, mutation) {
     if (!draft.jobs.some((job) => job.id === mutation.jobId)) {
-      return { ok: true, kind: "complete", jobId: mutation.jobId, alreadyCompleted: true };
+      return { ...completedBefore(draft, mutation), kind: "complete" };
     }
 
     const found = findLiveLease(draft, mutation.jobId, mutation.leaseToken, mutation.now);
 
     if (!found.ok) return { ...found, kind: "complete" };
 
+    const fields: CompletedJob = {
+      jobId: found.job.id,
+      leaseToken: mutation.leaseToken,
+      completedAt: mutation.now,
+      expiresAt: addSeconds(mutation.now, mutation.retainSeconds),
+    };
+
+    draft.completed.push(
+      found.job.idempotencyKey === undefined
+        ? fields
+        : { ...fields, idempotencyKey: found.job.idempotencyKey },
+    );
     draft.jobs.splice(found.index, 1);
     draft.changedAt = mutation.now;
 
@@ -315,8 +437,19 @@ const handlers: Handlers = {
   },
 };
 
-export function openDraft(source: QueueFile, newLeaseToken: () => LeaseToken): QueueDraft {
-  return { source, jobs: [...source.jobs], newLeaseToken, changedAt: undefined };
+export function openDraft(
+  source: QueueFile,
+  newLeaseToken: () => LeaseToken,
+  shed: Shedding = noShedding,
+): QueueDraft {
+  return {
+    source,
+    jobs: [...source.jobs],
+    completed: [...(source.completed ?? [])],
+    newLeaseToken,
+    shed,
+    changedAt: undefined,
+  };
 }
 
 export function applyMutation<K extends MutationKind>(
@@ -338,7 +471,12 @@ export function closeDraft(draft: QueueDraft): Effect.Effect<ClosedDraft, Invari
 
   if (changedAt === undefined) return Effect.succeed({ file: draft.source, changed: false });
 
-  const violation = invariantViolation(draft.jobs);
+  // Completed jobs are kept in completion order, so the oldest come first.
+  const completed = draft.completed
+    .filter((job) => !isAtOrAfter(changedAt, job.expiresAt))
+    .slice(draft.shed.evictedCompleted);
+
+  const violation = invariantViolation(draft.jobs, completed);
 
   if (violation) {
     return Effect.fail(
@@ -349,15 +487,68 @@ export function closeDraft(draft: QueueDraft): Effect.Effect<ClosedDraft, Invari
     );
   }
 
+  const { completed: _previous, ...rest } = draft.source;
+
+  const file: QueueFile = {
+    ...rest,
+    revision: draft.source.revision + 1,
+    updatedAt: changedAt,
+    jobs: draft.jobs,
+  };
+
+  // An empty list is left out, so a queue that never completed a job keeps
+  // the file shape older brokers wrote.
   return Effect.succeed({
-    file: {
-      ...draft.source,
-      revision: draft.source.revision + 1,
-      updatedAt: changedAt,
-      jobs: draft.jobs,
-    },
+    file: completed.length === 0 ? file : { ...file, completed },
     changed: true,
   });
+}
+
+// Picks what to give up when `file`, the result of a commit on `source`, is
+// `overflow` bytes over MAX_QUEUE_BYTES. Completed jobs go first, oldest
+// first: they only remember work that is done, and a queue full of them must
+// still accept and lease new work. Then new pushes, in arrival order: each new
+// job is kept while it still fits, so one oversized push does not refuse the
+// smaller ones after it. Undefined means nothing is left to give up.
+export function planShedding(
+  source: QueueFile,
+  file: QueueFile,
+  shed: Shedding,
+  overflow: number,
+): Shedding | undefined {
+  let freed = 0;
+  let evicted = 0;
+
+  for (const job of file.completed ?? []) {
+    if (freed >= overflow) break;
+
+    freed += serializedBytes(job) + 1;
+    evicted += 1;
+  }
+
+  if (evicted > 0) return { ...shed, evictedCompleted: shed.evictedCompleted + evicted };
+
+  const existing = new Set(source.jobs.map((job) => job.id));
+  const added = file.jobs.filter((job) => !existing.has(job.id));
+
+  if (added.length === 0) return undefined;
+
+  const sizes = added.map((job) => serializedBytes(job) + 1);
+  let room = sizes.reduce((total, size) => total + size, 0) - overflow;
+  const refused = new Set(shed.refusedPushes);
+
+  for (const [index, job] of added.entries()) {
+    const size = sizes[index] ?? 0;
+
+    if (size <= room) room -= size;
+    else refused.add(job.id);
+  }
+
+  return { ...shed, refusedPushes: refused };
+}
+
+export function serializedBytes(value: QueueFile | QueueJob | CompletedJob): number {
+  return new TextEncoder().encode(JSON.stringify(value)).byteLength;
 }
 
 export interface BatchResult extends ClosedDraft {
@@ -384,6 +575,42 @@ export function emptyQueue(queue: QueueName, now: Instant): QueueFile {
     updatedAt: now,
     jobs: [],
   };
+}
+
+export function publicJob(job: QueueJob): PublicJob {
+  if (job.state === "pending") return job;
+
+  const { token: _token, ...lease } = job.lease;
+
+  return { ...job, lease };
+}
+
+export function publicQueueFile(file: QueueFile): PublicQueueFile {
+  const { completed, ...rest } = file;
+  const shown: PublicQueueFile = { ...rest, jobs: file.jobs.map(publicJob) };
+
+  if (completed === undefined) return shown;
+
+  return { ...shown, completed: completed.map(({ leaseToken: _leaseToken, ...job }) => job) };
+}
+
+// A complete for a job that is no longer queued. It succeeds again only for
+// the token that completed it, while that completion is kept.
+function completedBefore(
+  draft: QueueDraft,
+  mutation: MutationOf<"complete">,
+): { ok: true; jobId: JobId; alreadyCompleted: true } | LeaseFailure {
+  const completed = draft.completed.find((job) => job.jobId === mutation.jobId);
+
+  if (!completed || isAtOrAfter(mutation.now, completed.expiresAt)) {
+    return { ok: false, code: "job_not_found", message: "job does not exist" };
+  }
+
+  if (completed.leaseToken !== mutation.leaseToken) {
+    return { ok: false, code: "lease_mismatch", message: "lease token does not own this job" };
+  }
+
+  return { ok: true, jobId: mutation.jobId, alreadyCompleted: true };
 }
 
 function isClaimable(job: QueueJob, now: Instant): boolean {

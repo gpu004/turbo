@@ -18,10 +18,16 @@
 (*                                                                         *)
 (* A batch that changes nothing is answered from the cached snapshot       *)
 (* without contacting R2. That path is not modeled. Its success replies,   *)
-(* `alreadyCompleted: true` for a job missing from the snapshot and        *)
+(* `alreadyCompleted: true` for a job the snapshot lists as completed and  *)
 (* `duplicate: true` for a key already in it, are only sound while a       *)
 (* single broker holds the queue, so `acked` and `done` here count only    *)
 (* replies that followed a conditional write.                              *)
+(*                                                                         *)
+(* The retained list of completed jobs is not modeled either. It only      *)
+(* changes those replies, and dropping it to fit MAX_QUEUE_BYTES only      *)
+(* turns them into 404s or new jobs. A push refused for size is never      *)
+(* acknowledged, which is the same as `Push` not being taken. Fitting the  *)
+(* batch happens before the write, so the compare-and-set is unchanged.    *)
 (***************************************************************************)
 EXTENDS Naturals, FiniteSets, TLC
 

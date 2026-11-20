@@ -11,11 +11,12 @@ R2 is the durable record. Durable Objects coordinate access, but the broker can 
 - FIFO claims among jobs that are ready to run
 - at-least-once execution through expiring leases
 - fencing tokens, so an old worker cannot heartbeat or complete a reassigned job
-- idempotent pushes when the client supplies an `Idempotency-Key`
+- idempotent pushes when the client supplies an `Idempotency-Key`, while the job is queued and for `COMPLETED_RETENTION_SECONDS` after it completes
+- lease tokens returned only to the worker that holds the lease
 - conditional R2 writes, so an unexpected second writer cannot silently overwrite the queue
 - one broker per queue, which avoids a global Durable Object bottleneck
 
-Each group commit rewrites the whole queue. Keep queue metadata below the default 8 MiB cap. Job payloads should reference large data rather than contain it. The cap leaves room for the source object, the updated copy, and serialized JSON within Cloudflare's 128 MB isolate limit.
+Each group commit rewrites the whole queue. Completed jobs are kept in it until their retention ends, so they count toward `MAX_QUEUE_BYTES`. When a commit would exceed the cap, the broker first drops the oldest completed jobs, which makes idempotency after completion best-effort. If that is not enough, it refuses pushes that do not fit with `507`, in arrival order, and commits the rest of the batch. Keep queue metadata below the default 8 MiB cap. Job payloads should reference large data rather than contain it. The cap leaves room for the source object, the updated copy, and serialized JSON within Cloudflare's 128 MB isolate limit.
 
 ## Run it locally
 
@@ -42,7 +43,7 @@ The project rules in `tools/oxlint/turbo` each confine one operation, such as re
 
 ## API
 
-Create a job:
+Create a job. The response is `201` with the job, or `200` with `"duplicate": true` when the idempotency key is already in use. For a key whose job is still queued the body has the `job`. For one whose job has completed it has `jobId` and `completedAt` instead. A push that does not fit within `MAX_QUEUE_BYTES` gets `507` with code `queue_full`.
 
 ```sh
 curl -i http://localhost:8787/queues/indexing/jobs \
@@ -59,7 +60,7 @@ curl -s http://localhost:8787/queues/indexing/claims \
   --data '{"workerId":"indexer-7","maxJobs":10}'
 ```
 
-Each job in the claim response contains a token at `lease.token`. Send that token as `leaseToken` with heartbeats and completion calls:
+Each job in the claim response contains a token at `lease.token`. Only claim and heartbeat responses include it. Send that token as `leaseToken` with heartbeats and completion calls:
 
 ```sh
 curl -s http://localhost:8787/queues/indexing/jobs/JOB_ID/heartbeat \
@@ -71,7 +72,9 @@ curl -s http://localhost:8787/queues/indexing/jobs/JOB_ID/complete \
   --data '{"leaseToken":"LEASE_TOKEN"}'
 ```
 
-Inspect the durable queue state:
+A stale or mismatched lease token gets `409`, and a job that is not queued gets `404` with code `job_not_found`. Completing a job again with the token that completed it returns `200` with `"alreadyCompleted": true` while the completion is retained, and `404` after that.
+
+Inspect the durable queue state. Lease tokens are removed from the response, and `completed` lists the retained completions:
 
 ```sh
 curl -s http://localhost:8787/queues/indexing
@@ -98,6 +101,7 @@ The defaults live in `wrangler.jsonc`:
 | --- | ---: | --- |
 | `QUEUE_BATCH_WINDOW_MS` | `5` | Time the broker waits to collect the first commit batch |
 | `QUEUE_LEASE_SECONDS` | `60` | Time before another worker may reclaim a job |
+| `COMPLETED_RETENTION_SECONDS` | `3600` | How long a completed job's idempotency key and lease token are kept |
 | `MAX_QUEUE_BYTES` | `8388608` | Maximum serialized queue object size |
 | `MAX_REQUEST_BYTES` | `262144` | Maximum JSON request body size |
 

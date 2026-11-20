@@ -21,7 +21,7 @@ import {
   QueueName,
   WorkerId,
 } from "./domain";
-import type { MutationResult, QueueFile } from "./model";
+import type { MutationResult, PublicQueueFile } from "./model";
 import { route, type Route } from "./router";
 import { decode, encode, type Encoded } from "./rpc";
 
@@ -105,6 +105,10 @@ const routes: ReadonlyArray<Route<Request, RequestError, Settings | Brokers>> = 
           broker.push(queue, encode(input.payload), idempotencyKey),
         ),
       );
+
+      if (!result.ok) {
+        return json({ error: { code: result.code, message: result.message } }, 507);
+      }
 
       return json(result, result.duplicate ? 200 : 201);
     }),
@@ -377,7 +381,7 @@ function json(value: JsonResponseBody, status = 200): Response {
 }
 
 // Sends a broker response as-is. The response body is the JSON text of `T`.
-function jsonText<T extends JsonResponseBody | QueueFile>(
+function jsonText<T extends JsonResponseBody | PublicQueueFile>(
   value: Encoded<T>,
   status = 200,
 ): Response {
