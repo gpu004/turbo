@@ -23,7 +23,9 @@ type SettingsVar =
   | "QUEUE_LEASE_SECONDS"
   | "MAX_QUEUE_BYTES"
   | "MAX_REQUEST_BYTES"
-  | "COMPLETED_RETENTION_SECONDS";
+  | "COMPLETED_RETENTION_SECONDS"
+  | "QUEUE_COMMIT_INTERVAL_MS"
+  | "MAX_PENDING_MUTATIONS";
 
 export type SettingsEnv = Partial<Readonly<Record<SettingsVar, string>>>;
 
@@ -33,7 +35,20 @@ const settingsConfig = Config.all({
   maxQueueBytes: boundedInteger("MAX_QUEUE_BYTES", 8 * 1024 * 1024, 1_024, 32 * 1024 * 1024),
   maxRequestBytes: boundedInteger("MAX_REQUEST_BYTES", 256 * 1024, 1_024, 4 * 1024 * 1024),
   completedRetentionSeconds: boundedInteger("COMPLETED_RETENTION_SECONDS", 3_600, 1, 604_800),
-});
+  commitIntervalMs: boundedInteger("QUEUE_COMMIT_INTERVAL_MS", 1_000, 0, 60_000),
+  maxPendingMutations: boundedInteger("MAX_PENDING_MUTATIONS", 10_000, 1, 1_000_000),
+}).pipe(
+  // A heartbeat or completion sent right after a claim waits up to one commit
+  // interval for its write. A lease of at least two intervals outlives that
+  // wait, with an interval to spare for the worker.
+  Config.map((settings) => ({
+    ...settings,
+    leaseSeconds: Math.max(
+      settings.leaseSeconds,
+      Math.ceil((2 * settings.commitIntervalMs) / 1_000),
+    ),
+  })),
+);
 
 export class Settings extends Context.Service<
   Settings,
@@ -43,6 +58,8 @@ export class Settings extends Context.Service<
     readonly maxQueueBytes: number;
     readonly maxRequestBytes: number;
     readonly completedRetentionSeconds: number;
+    readonly commitIntervalMs: number;
+    readonly maxPendingMutations: number;
   }
 >()("turbo/Settings") {
   // Every variable has a fallback, so parsing cannot fail.

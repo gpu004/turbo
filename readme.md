@@ -18,6 +18,8 @@ R2 is the durable record. Durable Objects coordinate access, but the broker can 
 
 Each group commit rewrites the whole queue. Completed jobs are kept in it until their retention ends, so they count toward `MAX_QUEUE_BYTES`. When a commit would exceed the cap, the broker first drops the oldest completed jobs, which makes idempotency after completion best-effort. If that is not enough, it refuses pushes that do not fit with `507`, in arrival order, and commits the rest of the batch. Keep queue metadata below the default 8 MiB cap. Job payloads should reference large data rather than contain it. The cap leaves room for the source object, the updated copy, and serialized JSON within Cloudflare's 128 MB isolate limit.
 
+R2 accepts about one write per second to the same key, so the broker writes a queue at most once per `QUEUE_COMMIT_INTERVAL_MS`. Requests that arrive while it waits join the next commit. A request can therefore take up to about one interval longer than its own R2 write. The broker retries a commit after a retryable R2 error (`429` and transient server errors) with jittered backoff. Each write carries a commit id, so a write that R2 applied but reported as failed is recognised on reload and not applied twice, provided no other broker wrote the queue in between.
+
 ## Run it locally
 
 ```sh
@@ -82,6 +84,8 @@ curl -s http://localhost:8787/queues/indexing
 
 `GET /health` does not touch R2. It only confirms that the Worker is running.
 
+Any mutation can get `503` with a `Retry-After` header. The code is `overloaded` when `MAX_PENDING_MUTATIONS` requests, or `MAX_QUEUE_BYTES` of pushed payloads, are already waiting for the next commit, and `storage_unavailable` when R2 still fails after five attempts. A `storage_unavailable` mutation may still have been committed, so retry pushes with the same idempotency key.
+
 ## Deploy
 
 Create the bucket once, then deploy:
@@ -100,7 +104,9 @@ The defaults live in `wrangler.jsonc`:
 | Variable | Default | Purpose |
 | --- | ---: | --- |
 | `QUEUE_BATCH_WINDOW_MS` | `5` | Time the broker waits to collect the first commit batch |
-| `QUEUE_LEASE_SECONDS` | `60` | Time before another worker may reclaim a job |
+| `QUEUE_LEASE_SECONDS` | `60` | Time before another worker may reclaim a job. Raised to at least two commit intervals, so a heartbeat sent right after a claim lands in time |
+| `QUEUE_COMMIT_INTERVAL_MS` | `1000` | Minimum time between the starts of two R2 writes for one queue |
+| `MAX_PENDING_MUTATIONS` | `10000` | Requests waiting for a commit before new ones get `503` |
 | `COMPLETED_RETENTION_SECONDS` | `3600` | How long a completed job's idempotency key and lease token are kept |
 | `MAX_QUEUE_BYTES` | `8388608` | Maximum serialized queue object size |
 | `MAX_REQUEST_BYTES` | `262144` | Maximum JSON request body size |

@@ -1,6 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import {
   Cause,
+  Clock,
   Context,
   Data,
   Deferred,
@@ -11,12 +12,15 @@ import {
   Option,
   Predicate,
   Ref,
+  Schedule,
 } from "effect";
 import { Settings } from "./config";
 import {
   currentInstant,
   Ids,
+  type CommitId,
   type IdempotencyKey,
+  type Instant,
   type JobId,
   type JsonValue,
   type LeaseToken,
@@ -44,7 +48,25 @@ import {
   type Shedding,
 } from "./model";
 
+// R2 ends an error message with its numeric code. These codes mean the same
+// request may succeed later: too many requests (R2 takes about one write per
+// second to a key), internal error, service unavailable, and client
+// disconnected. https://developers.cloudflare.com/r2/api/error-codes/
+const RETRYABLE_R2_CODE = /\((?:10058|10001|10043|10054)\)\s*$/u;
+
 export class StorageFailure extends Data.TaggedError("StorageFailure")<{
+  readonly message: string;
+  readonly retryable: boolean;
+}> {}
+
+function storageFailure(action: string, queue: QueueName, detail: string): StorageFailure {
+  return new StorageFailure({
+    message: `R2 ${action} for queue ${queue} failed: ${detail}`,
+    retryable: RETRYABLE_R2_CODE.test(detail),
+  });
+}
+
+export class Overloaded extends Data.TaggedError("Overloaded")<{
   readonly message: string;
 }> {}
 
@@ -71,7 +93,16 @@ type CommitError =
   | QueueTooLarge
   | CommitAttemptsExhausted;
 
-export type BrokerError = CommitError | QueueBindingConflict;
+export type BrokerError = CommitError | QueueBindingConflict | Overloaded;
+
+// What the Durable Object returns instead of failing when the queue cannot
+// take more work right now. The Worker answers it with 503 and Retry-After.
+export interface Unavailable {
+  readonly ok: false;
+  readonly kind: "unavailable";
+  readonly code: "overloaded" | "storage_unavailable";
+  readonly message: string;
+}
 
 export interface StoredQueue {
   readonly text: string;
@@ -104,7 +135,7 @@ export class QueueStore extends Context.Service<
             return Option.some({ text: await object.text(), etag: object.etag });
           },
           catch: (error) =>
-            new StorageFailure({ message: `R2 read for queue ${queue} failed: ${String(error)}` }),
+            storageFailure("read", queue, error instanceof Error ? error.message : String(error)),
         }),
       put: (queue, body, etag) =>
         Effect.tryPromise({
@@ -120,7 +151,7 @@ export class QueueStore extends Context.Service<
             return Option.fromNullishOr(stored?.etag);
           },
           catch: (error) =>
-            new StorageFailure({ message: `R2 write for queue ${queue} failed: ${String(error)}` }),
+            storageFailure("write", queue, error instanceof Error ? error.message : String(error)),
         }),
     });
   }
@@ -152,19 +183,35 @@ interface Snapshot {
 // A queued mutation, erased to a uniform type so different kinds can share one
 // batch. `apply` runs the mutation against a draft and returns the effect that
 // delivers its typed result; the result type never leaves the closure.
+//
+// `now` is the time of the commit attempt, not of the request. A command can
+// wait a commit interval or more before it is applied, and a lease must start
+// when it is written.
 interface PendingCommand {
-  readonly apply: (draft: QueueDraft) => Effect.Effect<void>;
+  readonly apply: (draft: QueueDraft, now: Instant) => Effect.Effect<void>;
   readonly fail: (cause: Cause.Cause<CommitError>) => Effect.Effect<void>;
+  // Payload bytes this command holds in memory until it commits.
+  readonly bytes: number;
 }
 
 interface FlushState {
   readonly pending: readonly PendingCommand[];
+  readonly pendingBytes: number;
   // Completes when the running flush loop has drained `pending`. Absent when
   // no loop is running.
   readonly idle: Deferred.Deferred<void> | undefined;
 }
 
 const MAX_COMMIT_ATTEMPTS = 5;
+
+type Retryable = CompareAndSetConflict | (StorageFailure & { readonly retryable: true });
+
+function isRetryable(error: CommitError | CompareAndSetConflict): error is Retryable {
+  return (
+    Predicate.isTagged(error, "CompareAndSetConflict") ||
+    (Predicate.isTagged(error, "StorageFailure") && error.retryable)
+  );
+}
 
 export class Broker extends Context.Service<
   Broker,
@@ -201,7 +248,8 @@ export class Broker extends Context.Service<
       const background = yield* Background;
       const boundQueue = yield* Ref.make(Option.none<QueueName>());
       const snapshotRef = yield* Ref.make(Option.none<Snapshot>());
-      const flush = yield* Ref.make<FlushState>({ pending: [], idle: undefined });
+      const lastPutAt = yield* Ref.make(Option.none<number>());
+      const flush = yield* Ref.make<FlushState>({ pending: [], pendingBytes: 0, idle: undefined });
 
       const bindQueue = Effect.fn(function* (queue: QueueName) {
         const bound = yield* Ref.modify(boundQueue, (current) =>
@@ -243,16 +291,20 @@ export class Broker extends Context.Service<
       const applyWithinLimit = Effect.fn(function* (
         snapshot: Snapshot,
         batch: readonly PendingCommand[],
+        commitId: CommitId,
       ) {
+        const now = yield* currentInstant;
         let shed: Shedding | undefined;
 
         while (true) {
           const draft = openDraft(snapshot.file, ids.newLeaseToken, shed);
-          const deliveries = batch.map((command) => command.apply(draft));
+          const deliveries = batch.map((command) => command.apply(draft, now));
           const closed = yield* closeDraft(draft);
-          const overflow = serializedBytes(closed.file) - settings.maxQueueBytes;
+          const file = closed.changed ? { ...closed.file, commitId } : closed.file;
+          const overflow = serializedBytes(file) - settings.maxQueueBytes;
 
-          if (!closed.changed || overflow <= 0) return { ...closed, deliveries };
+          if (!closed.changed || overflow <= 0)
+            return { file, changed: closed.changed, deliveries };
 
           shed = planShedding(snapshot.file, closed.file, draft.shed, overflow);
 
@@ -264,18 +316,67 @@ export class Broker extends Context.Service<
         }
       });
 
+      // R2 takes about one write per second to the same key. Waits until
+      // QUEUE_COMMIT_INTERVAL_MS has passed since the last write started.
+      const waitForTurn = Effect.gen(function* () {
+        const last = yield* Ref.get(lastPutAt);
+
+        if (Option.isNone(last)) return;
+
+        const elapsed = (yield* Clock.currentTimeMillis) - last.value;
+
+        if (elapsed < settings.commitIntervalMs) {
+          yield* Effect.sleep(settings.commitIntervalMs - elapsed);
+        }
+      });
+
+      const pacedPut = Effect.fn(function* (
+        queue: QueueName,
+        body: string,
+        etag: Option.Option<string>,
+      ) {
+        yield* waitForTurn;
+        yield* Ref.set(lastPutAt, Option.some(yield* Clock.currentTimeMillis));
+
+        return yield* store.put(queue, body, etag);
+      });
+
       // Applies the batch to the latest snapshot and writes it with an R2
       // compare-and-set. A failed compare-and-set clears the snapshot, so the
       // next attempt reloads from R2.
-      const commitOnce = Effect.fn(function* (queue: QueueName, batch: readonly PendingCommand[]) {
+      //
+      // A write that fails with an error may still have landed. `unconfirmed`
+      // keeps the deliveries of each such write by its commit id. If the
+      // reloaded file carries one of those ids, that write landed, and its
+      // results are delivered instead of applying the batch a second time.
+      const commitOnce = Effect.fn(function* (
+        queue: QueueName,
+        batch: readonly PendingCommand[],
+        unconfirmed: Map<CommitId, readonly Effect.Effect<void>[]>,
+      ) {
+        // Waiting before applying keeps a retry from stamping leases with a
+        // time that the wait in `pacedPut` would then eat into.
+        yield* waitForTurn;
+
         const snapshot = yield* load(queue, false);
-        const { file, changed, deliveries } = yield* applyWithinLimit(snapshot, batch);
+        const landed = snapshot.file.commitId && unconfirmed.get(snapshot.file.commitId);
+
+        if (landed) return landed;
+
+        const commitId = ids.newCommitId();
+        const { file, changed, deliveries } = yield* applyWithinLimit(snapshot, batch, commitId);
 
         if (!changed) return deliveries;
 
         const body = JSON.stringify(file);
 
-        const stored = yield* store.put(queue, body, snapshot.etag);
+        const stored = yield* pacedPut(queue, body, snapshot.etag).pipe(
+          Effect.tapError(() =>
+            Effect.sync(() => unconfirmed.set(commitId, deliveries)).pipe(
+              Effect.andThen(Ref.set(snapshotRef, Option.none())),
+            ),
+          ),
+        );
 
         if (Option.isNone(stored)) {
           yield* Ref.set(snapshotRef, Option.none());
@@ -290,17 +391,20 @@ export class Broker extends Context.Service<
         return deliveries;
       });
 
-      // Results are delivered only after R2 accepts the write.
+      // Results are delivered only after R2 accepts the write. A lost
+      // compare-and-set and a retryable R2 error are retried with jittered
+      // backoff, on top of the pacing in `pacedPut`.
       const commit = (queue: QueueName, batch: readonly PendingCommand[]) =>
-        commitOnce(queue, batch).pipe(
+        commitOnce(queue, batch, new Map()).pipe(
           Effect.retry({
             times: MAX_COMMIT_ATTEMPTS - 1,
-            while: Predicate.isTagged("CompareAndSetConflict"),
+            while: isRetryable,
+            schedule: Schedule.exponential("100 millis").pipe(Schedule.jittered),
           }),
-          Effect.catchTag("CompareAndSetConflict", () =>
+          Effect.catchIf(isRetryable, (error) =>
             Effect.fail(
               new CommitAttemptsExhausted({
-                message: `R2 compare-and-set failed after ${MAX_COMMIT_ATTEMPTS} attempts`,
+                message: `queue commit failed after ${MAX_COMMIT_ATTEMPTS} attempts: ${error.message}`,
               }),
             ),
           ),
@@ -311,14 +415,18 @@ export class Broker extends Context.Service<
           yield* Effect.sleep(settings.batchWindowMs);
 
           while (true) {
+            // Commands that arrive while the broker waits for its next write
+            // join the batch.
+            yield* waitForTurn;
+
             // Taking the batch and ending the loop are one step, so a command
             // enqueued after the last batch always starts a new loop.
             const batch = yield* Ref.modify(
               flush,
               (state): [readonly PendingCommand[], FlushState] =>
                 state.pending.length === 0
-                  ? [state.pending, { pending: [], idle: undefined }]
-                  : [state.pending, { pending: [], idle: state.idle }],
+                  ? [state.pending, { pending: [], pendingBytes: 0, idle: undefined }]
+                  : [state.pending, { pending: [], pendingBytes: 0, idle: state.idle }],
             );
 
             if (batch.length === 0) return;
@@ -339,7 +447,8 @@ export class Broker extends Context.Service<
 
       const enqueue = Effect.fn(function* <K extends MutationKind>(
         queue: QueueName,
-        mutation: MutationOf<K>,
+        mutation: (now: Instant) => MutationOf<K>,
+        bytes = 0,
       ) {
         yield* bindQueue(queue);
 
@@ -347,64 +456,87 @@ export class Broker extends Context.Service<
         const idle = yield* Deferred.make<void>();
 
         const command: PendingCommand = {
-          apply: (draft) => {
-            const outcome = applyMutation(draft, mutation);
+          apply: (draft, now) => {
+            const outcome = applyMutation(draft, mutation(now));
 
             return Deferred.succeed(result, outcome).pipe(Effect.asVoid);
           },
           fail: (cause) => Deferred.failCause(result, cause).pipe(Effect.asVoid),
+          bytes,
         };
 
-        const start = yield* Ref.modify(flush, (state): [boolean, FlushState] =>
-          state.idle === undefined
-            ? [true, { pending: [command], idle }]
-            : [false, { pending: [...state.pending, command], idle: state.idle }],
+        // Waiting payloads beyond MAX_QUEUE_BYTES could not fit in one commit
+        // anyway, and bounding them keeps a burst of large pushes from
+        // exhausting isolate memory.
+        const queued = yield* Ref.modify(
+          flush,
+          (state): ["start" | "joined" | "full", FlushState] => {
+            const full =
+              state.pending.length >= settings.maxPendingMutations ||
+              (state.pending.length > 0 && state.pendingBytes + bytes > settings.maxQueueBytes);
+
+            if (full) return ["full", state];
+
+            const pending = [...state.pending, command];
+            const pendingBytes = state.pendingBytes + bytes;
+
+            return state.idle === undefined
+              ? ["start", { pending, pendingBytes, idle }]
+              : ["joined", { pending, pendingBytes, idle: state.idle }];
+          },
         );
 
-        if (start) yield* background.run(flushLoop(idle));
+        if (queued === "full") {
+          return yield* new Overloaded({
+            message: "too many mutations are waiting for the next commit",
+          });
+        }
+
+        if (queued === "start") yield* background.run(flushLoop(idle));
 
         return yield* Deferred.await(result);
       });
 
       return {
         push: Effect.fn(function* (queue, payload, idempotencyKey) {
-          return yield* enqueue(queue, {
-            kind: "push",
-            id: ids.newJobId(),
-            idempotencyKey,
-            payload,
-            now: yield* currentInstant,
-          });
+          // One id for every attempt, so shedding and recovery see one job.
+          const id = ids.newJobId();
+
+          return yield* enqueue(
+            queue,
+            (now) => ({ kind: "push", id, idempotencyKey, payload, now }),
+            serializedBytes(payload),
+          );
         }),
 
         claim: Effect.fn(function* (queue, workerId, maxJobs) {
-          return yield* enqueue(queue, {
+          return yield* enqueue(queue, (now) => ({
             kind: "claim",
             workerId,
             maxJobs,
             leaseSeconds: settings.leaseSeconds,
-            now: yield* currentInstant,
-          });
+            now,
+          }));
         }),
 
         heartbeat: Effect.fn(function* (queue, jobId, leaseToken) {
-          return yield* enqueue(queue, {
+          return yield* enqueue(queue, (now) => ({
             kind: "heartbeat",
             jobId,
             leaseToken,
             leaseSeconds: settings.leaseSeconds,
-            now: yield* currentInstant,
-          });
+            now,
+          }));
         }),
 
         complete: Effect.fn(function* (queue, jobId, leaseToken) {
-          return yield* enqueue(queue, {
+          return yield* enqueue(queue, (now) => ({
             kind: "complete",
             jobId,
             leaseToken,
             retainSeconds: settings.completedRetentionSeconds,
-            now: yield* currentInstant,
-          });
+            now,
+          }));
         }),
 
         inspect: Effect.fn(function* (queue) {
@@ -448,36 +580,59 @@ export class QueueBroker extends DurableObject<Env> {
     queue: QueueName,
     payload: Encoded<JsonValue>,
     idempotencyKey: IdempotencyKey | undefined,
-  ): Promise<Encoded<ResultOf<"push">>> {
-    return this.run(Broker.use((broker) => broker.push(queue, decode(payload), idempotencyKey)));
+  ): Promise<Encoded<ResultOf<"push"> | Unavailable>> {
+    return this.mutate(Broker.use((broker) => broker.push(queue, decode(payload), idempotencyKey)));
   }
 
   claim(
     queue: QueueName,
     workerId: WorkerId,
     maxJobs: number,
-  ): Promise<Encoded<ResultOf<"claim">>> {
-    return this.run(Broker.use((broker) => broker.claim(queue, workerId, maxJobs)));
+  ): Promise<Encoded<ResultOf<"claim"> | Unavailable>> {
+    return this.mutate(Broker.use((broker) => broker.claim(queue, workerId, maxJobs)));
   }
 
   heartbeat(
     queue: QueueName,
     jobId: JobId,
     leaseToken: LeaseToken,
-  ): Promise<Encoded<ResultOf<"heartbeat">>> {
-    return this.run(Broker.use((broker) => broker.heartbeat(queue, jobId, leaseToken)));
+  ): Promise<Encoded<ResultOf<"heartbeat"> | Unavailable>> {
+    return this.mutate(Broker.use((broker) => broker.heartbeat(queue, jobId, leaseToken)));
   }
 
   complete(
     queue: QueueName,
     jobId: JobId,
     leaseToken: LeaseToken,
-  ): Promise<Encoded<ResultOf<"complete">>> {
-    return this.run(Broker.use((broker) => broker.complete(queue, jobId, leaseToken)));
+  ): Promise<Encoded<ResultOf<"complete"> | Unavailable>> {
+    return this.mutate(Broker.use((broker) => broker.complete(queue, jobId, leaseToken)));
   }
 
   inspect(queue: QueueName): Promise<Encoded<PublicQueueFile>> {
     return this.run(Broker.use((broker) => broker.inspect(queue)));
+  }
+
+  // Errors cannot cross the RPC boundary with their type, so the two the
+  // client should retry later travel as an `Unavailable` result.
+  private mutate<A>(
+    effect: Effect.Effect<A, BrokerError, Broker>,
+  ): Promise<Encoded<A | Unavailable>> {
+    const unavailable = (code: Unavailable["code"], message: string): Unavailable => ({
+      ok: false,
+      kind: "unavailable",
+      code,
+      message,
+    });
+
+    return this.run(
+      effect.pipe(
+        Effect.catchTags({
+          Overloaded: (error) => Effect.succeed(unavailable("overloaded", error.message)),
+          CommitAttemptsExhausted: (error) =>
+            Effect.succeed(unavailable("storage_unavailable", error.message)),
+        }),
+      ),
+    );
   }
 
   private run<A>(effect: Effect.Effect<A, BrokerError, Broker>): Promise<Encoded<A>> {

@@ -10,7 +10,7 @@ import {
   SchemaTransformation,
   Stream,
 } from "effect";
-import { QueueBroker } from "./broker";
+import { QueueBroker, type Unavailable } from "./broker";
 import { Settings } from "./config";
 import {
   IdempotencyKey,
@@ -106,6 +106,8 @@ const routes: ReadonlyArray<Route<Request, RequestError, Settings | Brokers>> = 
         ),
       );
 
+      if (result.kind === "unavailable") return yield* unavailableResponse(result);
+
       if (!result.ok) {
         return json({ error: { code: result.code, message: result.message } }, 507);
       }
@@ -119,9 +121,13 @@ const routes: ReadonlyArray<Route<Request, RequestError, Settings | Brokers>> = 
       const queue = yield* pathParam(QueueName, params.queue, "invalid_queue");
       const input = yield* readJson(request, ClaimBodySchema);
 
-      return jsonText(
+      const result = decode(
         yield* callBroker(queue, (broker) => broker.claim(queue, input.workerId, input.maxJobs)),
       );
+
+      if (result.kind === "unavailable") return yield* unavailableResponse(result);
+
+      return json(result);
     }),
   ),
 
@@ -131,7 +137,7 @@ const routes: ReadonlyArray<Route<Request, RequestError, Settings | Brokers>> = 
       const jobId = yield* pathParam(JobId, params.jobId, "invalid_job_id");
       const input = yield* readJson(request, LeaseBodySchema);
 
-      return mutationResponse(
+      return yield* mutationResponse(
         decode(
           yield* callBroker(queue, (broker) => broker.heartbeat(queue, jobId, input.leaseToken)),
         ),
@@ -145,7 +151,7 @@ const routes: ReadonlyArray<Route<Request, RequestError, Settings | Brokers>> = 
       const jobId = yield* pathParam(JobId, params.jobId, "invalid_job_id");
       const input = yield* readJson(request, LeaseBodySchema);
 
-      return mutationResponse(
+      return yield* mutationResponse(
         decode(
           yield* callBroker(queue, (broker) => broker.complete(queue, jobId, input.leaseToken)),
         ),
@@ -254,11 +260,27 @@ function parseIdempotencyKey(value: string): Effect.Effect<IdempotencyKey, HttpE
   );
 }
 
-function mutationResponse(result: MutationResult): Response {
-  if (result.ok) return json(result);
+function mutationResponse(
+  result: MutationResult | Unavailable,
+): Effect.Effect<Response, never, Settings> {
+  if (result.kind === "unavailable") return unavailableResponse(result);
+
+  if (result.ok) return Effect.succeed(json(result));
   const status = result.code === "job_not_found" ? 404 : 409;
 
-  return json({ error: { code: result.code, message: result.message } }, status);
+  return Effect.succeed(json({ error: { code: result.code, message: result.message } }, status));
+}
+
+// The broker writes at most once per QUEUE_COMMIT_INTERVAL_MS, so that is the
+// earliest a retry can land in a new commit.
+function unavailableResponse(result: Unavailable): Effect.Effect<Response, never, Settings> {
+  return Settings.use(({ commitIntervalMs }) =>
+    Effect.succeed(
+      json({ error: { code: result.code, message: result.message } }, 503, {
+        "retry-after": String(Math.max(1, Math.ceil(commitIntervalMs / 1_000))),
+      }),
+    ),
+  );
 }
 
 function readJson<A>(
@@ -373,10 +395,14 @@ type JsonResponseBody =
   | { error: { code: string; message: string } }
   | { ok: true };
 
-function json(value: JsonResponseBody, status = 200): Response {
+function json(
+  value: JsonResponseBody,
+  status = 200,
+  headers: Record<string, string> = {},
+): Response {
   return Response.json(value, {
     status,
-    headers: { "cache-control": "no-store" },
+    headers: { "cache-control": "no-store", ...headers },
   });
 }
 

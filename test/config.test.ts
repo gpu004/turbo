@@ -10,6 +10,8 @@ describe("Settings", () => {
       MAX_QUEUE_BYTES: "0x800",
       MAX_REQUEST_BYTES: "4096",
       COMPLETED_RETENTION_SECONDS: "60",
+      QUEUE_COMMIT_INTERVAL_MS: "250",
+      MAX_PENDING_MUTATIONS: "-1",
     };
 
     const settings = Effect.runSync(
@@ -22,6 +24,18 @@ describe("Settings", () => {
       maxQueueBytes: 8 * 1024 * 1024,
       maxRequestBytes: 4096,
       completedRetentionSeconds: 60,
+      commitIntervalMs: 250,
+      maxPendingMutations: 10_000,
     });
+  });
+
+  it("raises a lease shorter than two commit intervals", () => {
+    const env = { QUEUE_LEASE_SECONDS: "1", QUEUE_COMMIT_INTERVAL_MS: "1000" };
+
+    const settings = Effect.runSync(
+      Settings.use(Effect.succeed).pipe(Effect.provide(Settings.fromEnv(env))),
+    );
+
+    expect(settings.leaseSeconds).toBe(2);
   });
 });

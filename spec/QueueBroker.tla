@@ -9,12 +9,27 @@
 (* the spec allows several brokers. The guarantees in readme.md must hold  *)
 (* anyway, and they rely on the compare-and-set to do it.                  *)
 (*                                                                         *)
+(* R2 can apply a write and still fail the request, so the broker cannot   *)
+(* tell from the error whether the write landed. Each write carries a      *)
+(* commit id, here `writer`. After such an error the broker reloads: if R2 *)
+(* holds its own commit id, the write landed and it sends the replies      *)
+(* (`Confirm`); otherwise it gives the write up (`Abandon`) and applies    *)
+(* the batch again later, which is just another step. A write that fails   *)
+(* without landing changes nothing, so it needs no action. The `pushed`   *)
+(* guard keeps that later step from writing the same job id again, so the  *)
+(* model does not cover a broker that re-applies its own landed write      *)
+(* after another broker wrote on top of it.                                *)
+(*                                                                         *)
 (* Each step commits one mutation. test/model.property.test.ts checks that *)
 (* a group commit gives the same results as applying its mutations one at  *)
 (* a time, which is what makes that simplification sound. FIFO order and  *)
 (* idempotency keys are also left to the property tests.                   *)
 (* test/broker.test.ts runs the implementation against an in-memory store  *)
-(* with the same compare-and-set rule, including a lost race.              *)
+(* with the same compare-and-set rule, including a lost race and a write   *)
+(* that landed although R2 reported an error.                              *)
+(*                                                                         *)
+(* Pacing writes to QUEUE_COMMIT_INTERVAL_MS and the backoff between       *)
+(* retries only delay steps, so they are not modeled.                      *)
 (*                                                                         *)
 (* A batch that changes nothing is answered from the cached snapshot       *)
 (* without contacting R2. That path is not modeled. Its success replies,   *)
@@ -41,15 +56,18 @@ CONSTANTS
   CompareAndSet  \* FALSE models an unconditional R2 put
 
 VARIABLES
-  store,   \* the R2 object: [rev, jobs]
-  cache,   \* broker -> the snapshot it last loaded or wrote
-  acked,   \* jobs a client was told were pushed
-  done,    \* jobs a client was told were completed
-  held,    \* worker -> leases it was told it holds
-  tokens,  \* lease tokens issued so far; the next token is tokens + 1
+  store,    \* the R2 object: [rev, jobs, writer]
+  cache,    \* broker -> the snapshot it last loaded or wrote
+  acked,    \* jobs a client was told were pushed
+  done,     \* jobs a client was told were completed
+  held,     \* worker -> leases it was told it holds
+  tokens,   \* lease tokens issued so far; the next token is tokens + 1
+  inflight, \* broker -> {} or the one write whose result it does not know
+  pushed,   \* jobs a push was written for, replied or not
+  removed,  \* jobs a lease holder's completion was written for, replied or not
   now
 
-vars == <<store, cache, acked, done, held, tokens, now>>
+vars == <<store, cache, acked, done, held, tokens, inflight, pushed, removed, now>>
 
 Absent  == [state |-> "absent", token |-> 0, expires |-> 0]
 Pending == [state |-> "pending", token |-> 0, expires |-> 0]
@@ -63,60 +81,113 @@ Claimable(r) == r.state = "pending" \/ (r.state = "leased" /\ now >= r.expires)
 \* What `findLiveLease` in src/model.ts accepts.
 Live(r, l) == r.state = "leased" /\ r.token = l.token /\ now < r.expires
 
+\* The replies a write sends once it is known to have landed: jobs to add to
+\* `acked` and `done`, and <<worker, lease>> pairs to drop from and add to
+\* `held`.
+Replies(a, d, drop, add) == [acked |-> a, done |-> d, drop |-> drop, add |-> add]
+
+\* <<worker, lease>> pairs with a heartbeat or completion whose reply has not
+\* arrived. A worker waits for that reply before using the lease again.
+InFlight == UNION {p.replies.drop : p \in UNION {inflight[b] : b \in Brokers}}
+
+\* The leases a worker holds and is not waiting on.
+Settled(w) == {l \in held[w] : <<w, l>> \notin InFlight}
+
+Send(r) ==
+  /\ acked' = acked \cup r.acked
+  /\ done' = done \cup r.done
+  /\ held' = [w \in Workers |->
+               (held[w] \ {p[2] : p \in {q \in r.drop : q[1] = w}})
+                 \cup {p[2] : p \in {q \in r.add : q[1] = w}}]
+
 \* Broker b writes `jobs` as the next revision of its snapshot. With
 \* CompareAndSet the write succeeds only if R2 still holds that snapshot.
-Commit(b, jobs) ==
+\* Either the broker learns that it succeeded and sends `replies`, or R2
+\* reports an error and the broker holds the replies until it reloads.
+Commit(b, jobs, replies) ==
+  /\ inflight[b] = {}
   /\ CompareAndSet => store.rev = cache[b].rev
-  /\ LET next == [rev |-> cache[b].rev + 1, jobs |-> jobs]
+  /\ LET id   == <<b, cache[b].rev + 1>>
+         next == [rev |-> cache[b].rev + 1, jobs |-> jobs, writer |-> {id}]
      IN  /\ store' = next
-         /\ cache' = [cache EXCEPT ![b] = next]
+         /\ \/ /\ cache' = [cache EXCEPT ![b] = next]
+               /\ Send(replies)
+               /\ UNCHANGED inflight
+            \/ /\ inflight' = [inflight EXCEPT ![b] = {[id |-> id, replies |-> replies]}]
+               /\ UNCHANGED <<cache, acked, done, held>>
 
 Init ==
-  /\ store = [rev |-> 0, jobs |-> [j \in Jobs |-> Absent]]
+  /\ store = [rev |-> 0, jobs |-> [j \in Jobs |-> Absent], writer |-> {}]
   /\ cache = [b \in Brokers |-> store]
   /\ acked = {}
   /\ done = {}
   /\ held = [w \in Workers |-> {}]
   /\ tokens = 0
+  /\ inflight = [b \in Brokers |-> {}]
+  /\ pushed = {}
+  /\ removed = {}
   /\ now = 0
 
+\* A client that retries a push after an error sends a new job id, or the
+\* same idempotency key, so a job id is written by at most one push.
 Push(b, j) ==
-  /\ j \notin acked
+  /\ j \notin pushed
   /\ cache[b].jobs[j] = Absent
-  /\ Commit(b, [cache[b].jobs EXCEPT ![j] = Pending])
-  /\ acked' = acked \cup {j}
-  /\ UNCHANGED <<done, held, tokens, now>>
+  /\ Commit(b, [cache[b].jobs EXCEPT ![j] = Pending], Replies({j}, {}, {}, {}))
+  /\ pushed' = pushed \cup {j}
+  /\ UNCHANGED <<tokens, removed, now>>
 
 Claim(b, w, j) ==
   /\ Claimable(cache[b].jobs[j])
   /\ LET t == tokens + 1
          e == now + LeaseTicks
-     IN  /\ Commit(b, [cache[b].jobs EXCEPT ![j] = Leased(t, e)])
+     IN  /\ Commit(b, [cache[b].jobs EXCEPT ![j] = Leased(t, e)],
+                   Replies({}, {}, {}, {<<w, Lease(j, t, e)>>}))
          /\ tokens' = t
-         /\ held' = [held EXCEPT ![w] = @ \cup {Lease(j, t, e)}]
-  /\ UNCHANGED <<acked, done, now>>
+  /\ UNCHANGED <<pushed, removed, now>>
 
 Heartbeat(b, w, l) ==
-  /\ l \in held[w]
+  /\ l \in Settled(w)
   /\ Live(cache[b].jobs[l.job], l)
   /\ LET e == now + LeaseTicks
-     IN  /\ Commit(b, [cache[b].jobs EXCEPT ![l.job] = Leased(l.token, e)])
-         /\ held' = [held EXCEPT ![w] = (@ \ {l}) \cup {Lease(l.job, l.token, e)}]
-  /\ UNCHANGED <<acked, done, tokens, now>>
+     IN  Commit(b, [cache[b].jobs EXCEPT ![l.job] = Leased(l.token, e)],
+                Replies({}, {}, {<<w, l>>}, {<<w, Lease(l.job, l.token, e)>>}))
+  /\ UNCHANGED <<tokens, pushed, removed, now>>
 
 Complete(b, w, l) ==
-  /\ l \in held[w]
+  /\ l \in Settled(w)
   /\ Live(cache[b].jobs[l.job], l)
-  /\ Commit(b, [cache[b].jobs EXCEPT ![l.job] = Absent])
-  /\ done' = done \cup {l.job}
-  /\ held' = [held EXCEPT ![w] = @ \ {l}]
-  /\ UNCHANGED <<acked, tokens, now>>
+  /\ Commit(b, [cache[b].jobs EXCEPT ![l.job] = Absent],
+            Replies({}, {l.job}, {<<w, l>>}, {}))
+  /\ removed' = removed \cup {l.job}
+  /\ UNCHANGED <<tokens, pushed, now>>
+
+\* After an error, R2 holds the broker's own commit id, so its write landed.
+Confirm(b) ==
+  /\ \E p \in inflight[b] :
+       /\ store.writer = {p.id}
+       /\ Send(p.replies)
+  /\ cache' = [cache EXCEPT ![b] = store]
+  /\ inflight' = [inflight EXCEPT ![b] = {}]
+  /\ UNCHANGED <<store, tokens, pushed, removed, now>>
+
+\* After an error, R2 holds some other write. The broker gives up this write
+\* and replies with an error, and a worker that gets an error on a heartbeat
+\* or completion stops relying on that lease.
+Abandon(b) ==
+  /\ \E p \in inflight[b] :
+       /\ store.writer # {p.id}
+       /\ held' = [w \in Workers |-> held[w] \ {q[2] : q \in {r \in p.replies.drop : r[1] = w}}]
+  /\ cache' = [cache EXCEPT ![b] = store]
+  /\ inflight' = [inflight EXCEPT ![b] = {}]
+  /\ UNCHANGED <<store, acked, done, tokens, pushed, removed, now>>
 
 \* A failed compare-and-set, a restart, or `inspect` reloads from R2.
 Reload(b) ==
+  /\ inflight[b] = {}
   /\ cache[b] # store
   /\ cache' = [cache EXCEPT ![b] = store]
-  /\ UNCHANGED <<store, acked, done, held, tokens, now>>
+  /\ UNCHANGED <<store, acked, done, held, tokens, inflight, pushed, removed, now>>
 
 \* Workers forget a lease once it expires. An expired lease can no longer
 \* heartbeat or complete, so dropping it only keeps the state space small.
@@ -124,12 +195,14 @@ Tick ==
   /\ now < MaxTime
   /\ now' = now + 1
   /\ held' = [w \in Workers |-> {l \in held[w] : now' < l.expires}]
-  /\ UNCHANGED <<store, cache, acked, done, tokens>>
+  /\ UNCHANGED <<store, cache, acked, done, tokens, inflight, pushed, removed>>
 
 Next ==
   \/ Tick
   \/ \E b \in Brokers :
        \/ Reload(b)
+       \/ Confirm(b)
+       \/ Abandon(b)
        \/ \E j \in Jobs : Push(b, j)
        \/ \E w \in Workers, j \in Jobs : Claim(b, w, j)
        \/ \E w \in Workers : \E l \in held[w] : Heartbeat(b, w, l) \/ Complete(b, w, l)
@@ -147,20 +220,25 @@ Symmetry == Permutations(Brokers) \cup Permutations(Workers) \cup Permutations(J
 -----------------------------------------------------------------------------
 (* Invariants. Each one is a guarantee from readme.md.                     *)
 
-\* An acknowledged push stays in R2 until an acknowledged completion.
-NoLostJob == \A j \in acked \ done : store.jobs[j].state # "absent"
+\* An acknowledged push stays in R2 until the worker holding its lease
+\* completes it. A completion can land before its reply arrives, or without
+\* one if R2 reports an error and someone writes after it; the broker's retry
+\* then answers from the retained completion, which is not modeled. So this
+\* counts completions written, not completions replied to.
+NoLostJob == \A j \in acked \ removed : store.jobs[j].state # "absent"
 
 \* An acknowledged completion is never undone.
 NoResurrection == \A j \in done : store.jobs[j].state = "absent"
 
-\* A lease a worker was given, and has not seen expire, is the one R2 holds.
+\* A lease a worker was given, has not seen expire, and is not waiting on is
+\* the one R2 holds.
 LeaseHonoured ==
-  \A w \in Workers : \A l \in held[w] :
+  \A w \in Workers : \A l \in Settled(w) :
     now < l.expires => Live(store.jobs[l.job], l)
 
 \* At most one worker holds a live lease on a job.
 ExclusiveLease ==
   \A j \in Jobs :
-    Cardinality({w \in Workers : \E l \in held[w] : l.job = j /\ Live(store.jobs[j], l)}) <= 1
+    Cardinality({w \in Workers : \E l \in Settled(w) : l.job = j /\ Live(store.jobs[j], l)}) <= 1
 
 =============================================================================
