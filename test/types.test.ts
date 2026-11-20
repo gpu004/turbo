@@ -1,3 +1,4 @@
+import { Effect } from "effect";
 import { describe, expectTypeOf, it } from "vitest";
 import { Instant, JobId, LeaseToken, QueueName, WorkerId } from "../src/domain";
 import { applyMutation, emptyQueue, openDraft, type LeasedJob, type QueueJob } from "../src/model";
@@ -7,13 +8,13 @@ import { route } from "../src/router";
 // compiles, `tsc --noEmit` fails on the unused directive, so CI catches the
 // regression even though nothing here runs.
 
-const now = Instant.parse("2026-08-31T12:00:00.000Z");
+const now = Instant.make("2026-08-31T12:00:00.000Z");
 
-const jobId = JobId.parse("job-1");
+const jobId = JobId.make("job-1");
 
-const token = LeaseToken.parse("lease-1");
+const token = LeaseToken.make("lease-1");
 
-const draft = openDraft(emptyQueue(QueueName.parse("q"), now), () => token);
+const draft = openDraft(emptyQueue(QueueName.make("q"), now), () => token);
 
 describe("compile-time guarantees", () => {
   it("rejects unvalidated or swapped identifiers", () => {
@@ -35,7 +36,7 @@ describe("compile-time guarantees", () => {
   it("ties each mutation kind to its own result type", () => {
     const result = applyMutation(draft, {
       kind: "claim",
-      workerId: WorkerId.parse("w"),
+      workerId: WorkerId.make("w"),
       maxJobs: 1,
       leaseSeconds: 60,
       now,
@@ -60,13 +61,13 @@ describe("compile-time guarantees", () => {
   });
 
   it("only exposes route params the pattern captures", () => {
-    route("GET", "/queues/:queue", async (_context: null, params) => {
+    route("GET", "/queues/:queue", (_context: null, params) => {
       expectTypeOf(params.queue).toEqualTypeOf<string>();
 
       // @ts-expect-error the pattern has no :jobId
       void params.jobId;
 
-      return new Response();
+      return Effect.succeed(new Response());
     });
   });
 });

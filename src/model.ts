@@ -1,16 +1,15 @@
-import { z } from "zod";
+import { Data, Effect, Schema } from "effect";
 import {
   addSeconds,
   IdempotencyKey,
   Instant,
   isAtOrAfter,
   JobId,
-  JsonValueSchema,
+  JsonText,
+  JsonValue,
   LeaseToken,
-  parseJson,
   QueueName,
   WorkerId,
-  type JsonValue,
 } from "./domain";
 
 export interface Lease {
@@ -53,48 +52,64 @@ export interface QueueFile {
   readonly jobs: readonly QueueJob[];
 }
 
-const LeaseSchema = z
-  .object({
-    token: LeaseToken,
-    workerId: WorkerId,
-    heartbeatAt: Instant,
-    expiresAt: Instant,
-  })
-  .loose();
+// Stored objects keep fields this version does not know about, so a broker
+// that rewrites a queue preserves fields a newer broker added.
+function storedStruct<const Fields extends Schema.Struct.Fields>(fields: Fields) {
+  return Schema.StructWithRest(Schema.Struct(fields), [Schema.Record(Schema.String, JsonValue)]);
+}
+
+const LeaseSchema = storedStruct({
+  token: LeaseToken,
+  workerId: WorkerId,
+  heartbeatAt: Instant,
+  expiresAt: Instant,
+});
 
 const jobFields = {
   id: JobId,
-  payload: JsonValueSchema,
-  idempotencyKey: IdempotencyKey.exactOptional(),
+  payload: JsonValue,
+  idempotencyKey: Schema.optionalKey(IdempotencyKey),
   enqueuedAt: Instant,
-  attempts: z.number().int().min(0),
+  attempts: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
 };
 
-const QueueJobSchema: z.ZodType<QueueJob> = z.discriminatedUnion("state", [
-  z.object({ ...jobFields, state: z.literal("pending") }).loose(),
-  z.object({ ...jobFields, state: z.literal("leased"), lease: LeaseSchema }).loose(),
+const QueueJobSchema = Schema.Union([
+  storedStruct({ ...jobFields, state: Schema.Literal("pending") }),
+  storedStruct({ ...jobFields, state: Schema.Literal("leased"), lease: LeaseSchema }),
 ]);
 
-const QueueFileSchema: z.ZodType<QueueFile> = z
-  .object({
-    version: z.literal(1),
-    queue: QueueName,
-    broker: z
-      .object({
-        kind: z.literal("durable-object"),
-        name: QueueName,
-      })
-      .loose(),
-    revision: z.number().int().min(0),
-    updatedAt: Instant,
-    jobs: z.array(QueueJobSchema),
-  })
-  .loose()
-  .superRefine((file, context) => {
-    const violation = invariantViolation(file.jobs);
+const QueueFileSchema: Schema.Decoder<QueueFile> = storedStruct({
+  version: Schema.Literal(1),
+  queue: QueueName,
+  broker: storedStruct({
+    kind: Schema.Literal("durable-object"),
+    name: QueueName,
+  }),
+  revision: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  updatedAt: Instant,
+  jobs: Schema.Array(QueueJobSchema),
+}).check(Schema.makeFilter((file) => invariantViolation(file.jobs)));
 
-    if (violation) context.addIssue({ code: "custom", message: violation });
-  });
+// Only the identity fields, so a file for another queue or format version is
+// reported as incompatible rather than malformed.
+const QueueIdentitySchema = Schema.Struct({ version: Schema.Literal(1), queue: Schema.String });
+
+export class MalformedQueueFile extends Data.TaggedError("MalformedQueueFile")<{
+  readonly queue: QueueName;
+  readonly message: string;
+}> {}
+
+export class IncompatibleQueueFile extends Data.TaggedError("IncompatibleQueueFile")<{
+  readonly queue: QueueName;
+  readonly message: string;
+}> {}
+
+export type QueueFileError = MalformedQueueFile | IncompatibleQueueFile;
+
+export class InvariantViolation extends Data.TaggedError("InvariantViolation")<{
+  readonly queue: QueueName;
+  readonly message: string;
+}> {}
 
 // Invariants the types cannot express. They are checked when a queue is
 // loaded from R2 and again in `closeDraft`, before a file can be written, so a
@@ -318,26 +333,31 @@ export interface ClosedDraft {
   changed: boolean;
 }
 
-export function closeDraft(draft: QueueDraft): ClosedDraft {
-  if (draft.changedAt === undefined) return { file: draft.source, changed: false };
+export function closeDraft(draft: QueueDraft): Effect.Effect<ClosedDraft, InvariantViolation> {
+  const changedAt = draft.changedAt;
+
+  if (changedAt === undefined) return Effect.succeed({ file: draft.source, changed: false });
 
   const violation = invariantViolation(draft.jobs);
 
   if (violation) {
-    throw new Error(
-      `commit for queue ${draft.source.queue} would break an invariant: ${violation}`,
+    return Effect.fail(
+      new InvariantViolation({
+        queue: draft.source.queue,
+        message: `commit for queue ${draft.source.queue} would break an invariant: ${violation}`,
+      }),
     );
   }
 
-  return {
+  return Effect.succeed({
     file: {
       ...draft.source,
       revision: draft.source.revision + 1,
-      updatedAt: draft.changedAt,
+      updatedAt: changedAt,
       jobs: draft.jobs,
     },
     changed: true,
-  };
+  });
 }
 
 export interface BatchResult extends ClosedDraft {
@@ -348,11 +368,11 @@ export function applyBatch(
   source: QueueFile,
   mutations: readonly QueueMutation[],
   newLeaseToken: () => LeaseToken,
-): BatchResult {
+): Effect.Effect<BatchResult, InvariantViolation> {
   const draft = openDraft(source, newLeaseToken);
   const results = mutations.map((mutation) => applyMutation(draft, mutation));
 
-  return { ...closeDraft(draft), results };
+  return closeDraft(draft).pipe(Effect.map((closed) => ({ ...closed, results })));
 }
 
 export function emptyQueue(queue: QueueName, now: Instant): QueueFile {
@@ -394,25 +414,33 @@ function findLiveLease(
   return { ok: true, index, job };
 }
 
-export function parseQueueFile(text: string, expectedQueue: QueueName): QueueFile {
-  const json = parseJson(text);
+export function parseQueueFile(
+  text: string,
+  expectedQueue: QueueName,
+): Effect.Effect<QueueFile, QueueFileError> {
+  const malformed = new MalformedQueueFile({
+    queue: expectedQueue,
+    message: `R2 object for queue ${expectedQueue} is malformed`,
+  });
 
-  if (!json.ok) throw new Error(`R2 object for queue ${expectedQueue} is malformed`);
+  const incompatible = new IncompatibleQueueFile({
+    queue: expectedQueue,
+    message: `R2 object for queue ${expectedQueue} has an incompatible format`,
+  });
 
-  const identity = z
-    .object({ version: z.literal(1), queue: z.string() })
-    .loose()
-    .safeParse(json.value);
+  return Effect.gen(function* () {
+    const json = yield* Schema.decodeUnknownEffect(JsonText)(text).pipe(
+      Effect.mapError(() => malformed),
+    );
 
-  if (!identity.success || identity.data.queue !== expectedQueue) {
-    throw new Error(`R2 object for queue ${expectedQueue} has an incompatible format`);
-  }
+    const identity = yield* Schema.decodeUnknownEffect(QueueIdentitySchema)(json).pipe(
+      Effect.mapError(() => incompatible),
+    );
 
-  const file = QueueFileSchema.safeParse(json.value);
+    if (identity.queue !== expectedQueue) return yield* incompatible;
 
-  if (!file.success) {
-    throw new Error(`R2 object for queue ${expectedQueue} is malformed`);
-  }
-
-  return file.data;
+    return yield* Schema.decodeUnknownEffect(QueueFileSchema)(json).pipe(
+      Effect.mapError(() => malformed),
+    );
+  });
 }

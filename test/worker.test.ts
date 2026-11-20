@@ -1,4 +1,4 @@
-import { exports } from "cloudflare:workers";
+import { env, exports } from "cloudflare:workers";
 import { beforeAll, describe, expect, it } from "vitest";
 import type { JsonValue } from "../src/domain";
 
@@ -114,6 +114,19 @@ describe("queue Worker", () => {
     expect(invalidMaxJobs.status).toBe(400);
     await expect(invalidMaxJobs.json()).resolves.toMatchObject({
       error: { code: "invalid_body", message: "maxJobs must be an integer from 1 to 100" },
+    });
+  });
+});
+
+describe("queue Worker failures", () => {
+  it("answers 500 without details when the stored queue is corrupt", async () => {
+    await env.QUEUE_BUCKET.put("queues/corrupt/queue.json", "not json");
+
+    const response = await exports.default.fetch("https://queue.test/queues/corrupt");
+
+    expect(response.status).toBe(500);
+    await expect(response.json()).resolves.toEqual({
+      error: { code: "internal_error", message: "queue operation failed" },
     });
   });
 });

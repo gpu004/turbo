@@ -30,7 +30,9 @@ npm run dev
 
 Wrangler simulates both R2 and Durable Objects locally.
 
-`npm run lint` uses Oxlint with the vendored anti-slop plugin at `tools/oxlint/anti-slop`. See the [upstream record](tools/oxlint/anti-slop/UPSTREAM.md) for its source and local changes.
+The Worker and the broker are written with [Effect](https://effect.website). Schemas validate every request and every stored queue. R2, the clock, and id generation are services, so `test/broker.test.ts` runs the commit protocol against an in-memory store.
+
+`npm run lint` uses Oxlint with the vendored anti-slop plugin at `tools/oxlint/anti-slop`, including its Effect rules. See the [upstream record](tools/oxlint/anti-slop/UPSTREAM.md) for its source and local changes.
 
 The project rules in `tools/oxlint/turbo` each confine one operation, such as reading the clock or parsing JSON, to the module that owns it. `npm run lint:rules` tests them against the fixtures in `tools/oxlint/turbo/fixtures`.
 

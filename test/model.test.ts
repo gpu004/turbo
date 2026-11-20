@@ -1,3 +1,4 @@
+import { Effect } from "effect";
 import { describe, expect, expectTypeOf, it } from "vitest";
 import { IdempotencyKey, Instant, JobId, LeaseToken, QueueName, WorkerId } from "../src/domain";
 import {
@@ -7,37 +8,45 @@ import {
   invariantViolation,
   openDraft,
   parseQueueFile,
+  type BatchResult,
   type LeasedJob,
   type PendingJob,
   type QueueMutation,
 } from "../src/model";
 
-const NOW = Instant.parse("2026-08-31T12:00:00.000Z");
+const NOW = Instant.make("2026-08-31T12:00:00.000Z");
 
-const Q = QueueName.parse("indexing");
+const Q = QueueName.make("indexing");
 
 describe("queue file parser", () => {
   it("parses a valid queue file", () => {
     const file = emptyQueue(Q, NOW);
 
-    expect(parseQueueFile(JSON.stringify(file), Q)).toEqual(file);
+    expect(Effect.runSync(parseQueueFile(JSON.stringify(file), Q))).toEqual(file);
   });
 
   it("rejects a queue file for a different queue", () => {
-    const file = emptyQueue(QueueName.parse("other"), NOW);
+    const file = emptyQueue(QueueName.make("other"), NOW);
 
-    expect(() => parseQueueFile(JSON.stringify(file), Q)).toThrow(
+    expect(() => Effect.runSync(parseQueueFile(JSON.stringify(file), Q))).toThrow(
       "R2 object for queue indexing has an incompatible format",
     );
   });
 
   it("rejects invalid JSON and malformed queue files", () => {
-    expect(() => parseQueueFile("not json", Q)).toThrow(
+    expect(() => Effect.runSync(parseQueueFile("not json", Q))).toThrow(
       "R2 object for queue indexing is malformed",
     );
-    expect(() => parseQueueFile('{"version":1,"queue":"indexing","jobs":"x"}', Q)).toThrow(
-      "R2 object for queue indexing is malformed",
-    );
+    expect(() =>
+      Effect.runSync(parseQueueFile('{"version":1,"queue":"indexing","jobs":"x"}', Q)),
+    ).toThrow("R2 object for queue indexing is malformed");
+  });
+
+  it("keeps fields a newer broker added", () => {
+    const job = { id: "j", payload: null, enqueuedAt: NOW, attempts: 0, state: "pending", tier: 2 };
+    const file = { ...emptyQueue(Q, NOW), shard: "eu", jobs: [job] };
+
+    expect(Effect.runSync(parseQueueFile(JSON.stringify(file), Q))).toEqual(file);
   });
 
   it("rejects a leased job without a lease", () => {
@@ -46,23 +55,20 @@ describe("queue file parser", () => {
       jobs: [{ id: "j", payload: null, enqueuedAt: NOW, attempts: 1, state: "leased" }],
     };
 
-    expect(() => parseQueueFile(JSON.stringify(file), Q)).toThrow("is malformed");
+    expect(() => Effect.runSync(parseQueueFile(JSON.stringify(file), Q))).toThrow("is malformed");
   });
 
   it("rejects a stored queue that breaks an invariant", () => {
     const job = { id: "j", payload: null, enqueuedAt: NOW, attempts: 0, state: "pending" };
     const file = { ...emptyQueue(Q, NOW), jobs: [job, job] };
 
-    expect(() => parseQueueFile(JSON.stringify(file), Q)).toThrow("is malformed");
+    expect(() => Effect.runSync(parseQueueFile(JSON.stringify(file), Q))).toThrow("is malformed");
   });
 });
 
 describe("queue invariants", () => {
   it("refuses to close a draft that breaks one", () => {
-    const draft = openDraft(
-      applyBatch(emptyQueue(Q, NOW), [push("job-1")], tokens()).file,
-      tokens(),
-    );
+    const draft = openDraft(runBatch(emptyQueue(Q, NOW), [push("job-1")], tokens()).file, tokens());
 
     const [job] = draft.jobs;
 
@@ -70,12 +76,12 @@ describe("queue invariants", () => {
     draft.jobs.push(job);
     draft.changedAt = NOW;
 
-    expect(() => closeDraft(draft)).toThrow("job job-1 appears twice");
+    expect(() => Effect.runSync(closeDraft(draft))).toThrow("job job-1 appears twice");
   });
 
   it("reports each kind of violation", () => {
     const pending: PendingJob = {
-      id: JobId.parse("a"),
+      id: JobId.make("a"),
       payload: null,
       enqueuedAt: NOW,
       attempts: 0,
@@ -84,18 +90,18 @@ describe("queue invariants", () => {
 
     const leased: LeasedJob = {
       ...pending,
-      id: JobId.parse("b"),
+      id: JobId.make("b"),
       state: "leased",
       attempts: 1,
       lease: {
-        token: LeaseToken.parse("t"),
-        workerId: WorkerId.parse("w"),
+        token: LeaseToken.make("t"),
+        workerId: WorkerId.make("w"),
         heartbeatAt: NOW,
-        expiresAt: Instant.parse("2026-08-31T12:01:00.000Z"),
+        expiresAt: Instant.make("2026-08-31T12:01:00.000Z"),
       },
     };
 
-    const key = IdempotencyKey.parse("k");
+    const key = IdempotencyKey.make("k");
 
     expect(invariantViolation([pending, leased])).toBeUndefined();
     expect(invariantViolation([pending, pending])).toMatch("appears twice");
@@ -107,9 +113,7 @@ describe("queue invariants", () => {
     ).toMatch("used by two jobs");
     expect(invariantViolation([{ ...pending, attempts: 1 }])).toMatch("has 1 attempts");
     expect(invariantViolation([{ ...leased, attempts: 0 }])).toMatch("has no attempts");
-    expect(invariantViolation([leased, { ...leased, id: JobId.parse("c") }])).toMatch(
-      "lease token",
-    );
+    expect(invariantViolation([leased, { ...leased, id: JobId.make("c") }])).toMatch("lease token");
     expect(invariantViolation([{ ...leased, lease: { ...leased.lease, expiresAt: NOW } }])).toMatch(
       "expires before its last heartbeat",
     );
@@ -118,7 +122,7 @@ describe("queue invariants", () => {
 
 describe("queue model", () => {
   it("deduplicates pushes by idempotency key", () => {
-    const pushed = applyBatch(
+    const pushed = runBatch(
       emptyQueue(Q, NOW),
       [push("job-1", "wal-1"), push("job-2", "wal-1")],
       tokens(),
@@ -130,8 +134,8 @@ describe("queue model", () => {
   });
 
   it("claims in FIFO order and fences a reassigned lease", () => {
-    const queued = applyBatch(emptyQueue(Q, NOW), [push("job-1"), push("job-2")], tokens()).file;
-    const firstClaim = applyBatch(queued, [claim("worker-a", 1, NOW)], tokens("lease-a"));
+    const queued = runBatch(emptyQueue(Q, NOW), [push("job-1"), push("job-2")], tokens()).file;
+    const firstClaim = runBatch(queued, [claim("worker-a", 1, NOW)], tokens("lease-a"));
 
     expect(firstClaim.results[0]).toMatchObject({
       ok: true,
@@ -139,9 +143,9 @@ describe("queue model", () => {
       jobs: [{ id: "job-1", attempts: 1 }],
     });
 
-    const afterExpiry = Instant.parse("2026-08-31T12:01:01.000Z");
+    const afterExpiry = Instant.make("2026-08-31T12:01:01.000Z");
 
-    const secondClaim = applyBatch(
+    const secondClaim = runBatch(
       firstClaim.file,
       [claim("worker-b", 1, afterExpiry)],
       tokens("lease-b"),
@@ -153,7 +157,7 @@ describe("queue model", () => {
       jobs: [{ id: "job-1", attempts: 2 }],
     });
 
-    const oldCompletion = applyBatch(
+    const oldCompletion = runBatch(
       secondClaim.file,
       [complete("job-1", "lease-a", afterExpiry)],
       tokens(),
@@ -164,17 +168,17 @@ describe("queue model", () => {
   });
 
   it("extends a live lease and removes a completed job", () => {
-    const queued = applyBatch(emptyQueue(Q, NOW), [push("job-1")], tokens()).file;
-    const leased = applyBatch(queued, [claim("worker-a", 1, NOW)], tokens("lease-a")).file;
-    const heartbeatAt = Instant.parse("2026-08-31T12:00:30.000Z");
+    const queued = runBatch(emptyQueue(Q, NOW), [push("job-1")], tokens()).file;
+    const leased = runBatch(queued, [claim("worker-a", 1, NOW)], tokens("lease-a")).file;
+    const heartbeatAt = Instant.make("2026-08-31T12:00:30.000Z");
 
-    const heartbeat = applyBatch(
+    const heartbeat = runBatch(
       leased,
       [
         {
           kind: "heartbeat",
-          jobId: JobId.parse("job-1"),
-          leaseToken: LeaseToken.parse("lease-a"),
+          jobId: JobId.make("job-1"),
+          leaseToken: LeaseToken.make("lease-a"),
           leaseSeconds: 60,
           now: heartbeatAt,
         },
@@ -188,7 +192,7 @@ describe("queue model", () => {
       job: { lease: { expiresAt: "2026-08-31T12:01:30.000Z" } },
     });
 
-    const completed = applyBatch(
+    const completed = runBatch(
       heartbeat.file,
       [complete("job-1", "lease-a", heartbeatAt)],
       tokens(),
@@ -203,17 +207,17 @@ describe("queue model", () => {
   });
 
   it("does not change a result already handed out when a later mutation in the batch touches the job", () => {
-    const queued = applyBatch(emptyQueue(Q, NOW), [push("job-1")], tokens()).file;
-    const later = Instant.parse("2026-08-31T12:00:30.000Z");
+    const queued = runBatch(emptyQueue(Q, NOW), [push("job-1")], tokens()).file;
+    const later = Instant.make("2026-08-31T12:00:30.000Z");
 
-    const batch = applyBatch(
+    const batch = runBatch(
       queued,
       [
         claim("worker-a", 1, NOW),
         {
           kind: "heartbeat",
-          jobId: JobId.parse("job-1"),
-          leaseToken: LeaseToken.parse("lease-a"),
+          jobId: JobId.make("job-1"),
+          leaseToken: LeaseToken.make("lease-a"),
           leaseSeconds: 60,
           now: later,
         },
@@ -229,9 +233,9 @@ describe("queue model", () => {
   });
 
   it("leaves the source file untouched", () => {
-    const source = applyBatch(emptyQueue(Q, NOW), [push("job-1")], tokens()).file;
+    const source = runBatch(emptyQueue(Q, NOW), [push("job-1")], tokens()).file;
     const before = structuredClone(source);
-    applyBatch(source, [claim("worker-a", 1, NOW)], tokens("lease-a"));
+    runBatch(source, [claim("worker-a", 1, NOW)], tokens("lease-a"));
 
     expect(source).toEqual(before);
   });
@@ -252,22 +256,22 @@ describe("types", () => {
 function push(id: string, idempotencyKey?: string): QueueMutation {
   return {
     kind: "push",
-    id: JobId.parse(id),
-    idempotencyKey: idempotencyKey === undefined ? undefined : IdempotencyKey.parse(idempotencyKey),
+    id: JobId.make(id),
+    idempotencyKey: idempotencyKey === undefined ? undefined : IdempotencyKey.make(idempotencyKey),
     payload: { id },
     now: NOW,
   };
 }
 
 function claim(workerId: string, maxJobs: number, now: Instant): QueueMutation {
-  return { kind: "claim", workerId: WorkerId.parse(workerId), maxJobs, leaseSeconds: 60, now };
+  return { kind: "claim", workerId: WorkerId.make(workerId), maxJobs, leaseSeconds: 60, now };
 }
 
 function complete(jobId: string, leaseToken: string, now: Instant): QueueMutation {
   return {
     kind: "complete",
-    jobId: JobId.parse(jobId),
-    leaseToken: LeaseToken.parse(leaseToken),
+    jobId: JobId.make(jobId),
+    leaseToken: LeaseToken.make(leaseToken),
     now,
   };
 }
@@ -275,7 +279,7 @@ function complete(jobId: string, leaseToken: string, now: Instant): QueueMutatio
 // Hands out the given lease tokens in order, and fails the test if the model
 // asks for more than it was given.
 function tokens(...values: string[]): () => LeaseToken {
-  const queue = values.map((value) => LeaseToken.parse(value));
+  const queue = values.map((value) => LeaseToken.make(value));
 
   return () => {
     const next = queue.shift();
@@ -284,4 +288,8 @@ function tokens(...values: string[]): () => LeaseToken {
 
     return next;
   };
+}
+
+function runBatch(...args: Parameters<typeof applyBatch>): BatchResult {
+  return Effect.runSync(applyBatch(...args));
 }

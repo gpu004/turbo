@@ -13,6 +13,8 @@
 (* a group commit gives the same results as applying its mutations one at  *)
 (* a time, which is what makes that simplification sound. FIFO order and  *)
 (* idempotency keys are also left to the property tests.                   *)
+(* test/broker.test.ts runs the implementation against an in-memory store  *)
+(* with the same compare-and-set rule, including a lost race.              *)
 (*                                                                         *)
 (* A batch that changes nothing is answered from the cached snapshot       *)
 (* without contacting R2. That path is not modeled. Its success replies,   *)
