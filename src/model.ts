@@ -127,7 +127,9 @@ const QueueFileSchema: Schema.Decoder<QueueFile> = storedStruct({
   updatedAt: Instant,
   jobs: Schema.Array(QueueJobSchema),
   completed: Schema.optionalKey(Schema.Array(CompletedJobSchema)),
-}).check(Schema.makeFilter((file) => invariantViolation(file.jobs, file.completed)));
+}).check(
+  Schema.makeFilter((file) => invariantViolation(file.jobs, supersede(file.jobs, file.completed))),
+);
 
 // Only the identity fields, so a file for another queue or format version is
 // reported as incompatible rather than malformed.
@@ -445,7 +447,7 @@ export function openDraft(
   return {
     source,
     jobs: [...source.jobs],
-    completed: [...(source.completed ?? [])],
+    completed: supersede(source.jobs, source.completed),
     newLeaseToken,
     shed,
     changedAt: undefined,
@@ -575,6 +577,21 @@ export function emptyQueue(queue: QueueName, now: Instant): QueueFile {
     updatedAt: now,
     jobs: [],
   };
+}
+
+// A broker older than the `completed` list keeps it when it rewrites a queue,
+// but can enqueue a job that reuses a completed job's idempotency key. The
+// queued job wins, so such a file still loads and its next commit drops the
+// stale completion.
+function supersede(
+  jobs: readonly QueueJob[],
+  completed: readonly CompletedJob[] = [],
+): CompletedJob[] {
+  const keys = new Set(jobs.map((job) => job.idempotencyKey));
+
+  return completed.filter(
+    (job) => job.idempotencyKey === undefined || !keys.has(job.idempotencyKey),
+  );
 }
 
 export function publicJob(job: QueueJob): PublicJob {

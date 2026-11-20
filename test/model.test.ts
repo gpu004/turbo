@@ -70,6 +70,32 @@ describe("queue file parser", () => {
     ).toEqual([completed]);
   });
 
+  it("lets a queued job win over a completed job with the same key, as an older broker writes", () => {
+    const job = {
+      id: "j2",
+      payload: null,
+      enqueuedAt: NOW,
+      attempts: 0,
+      state: "pending",
+      idempotencyKey: "k",
+    };
+
+    const completed = {
+      jobId: "j1",
+      leaseToken: "t",
+      idempotencyKey: "k",
+      completedAt: NOW,
+      expiresAt: "2026-08-31T13:00:00.000Z",
+    };
+
+    const text = JSON.stringify({ ...emptyQueue(Q, NOW), jobs: [job], completed: [completed] });
+    const file = Effect.runSync(parseQueueFile(text, Q));
+    const pushed = runBatch(file, [push("j3", "k"), push("j4")], tokens());
+
+    expect(pushed.results[0]).toMatchObject({ duplicate: true, job: { id: "j2" } });
+    expect(pushed.file.completed).toBeUndefined();
+  });
+
   it("rejects a stored queue that breaks an invariant", () => {
     const job = { id: "j", payload: null, enqueuedAt: NOW, attempts: 0, state: "pending" };
     const file = { ...emptyQueue(Q, NOW), jobs: [job, job] };
