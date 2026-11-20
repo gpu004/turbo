@@ -15,7 +15,7 @@ The rule is MIT-licensed. Keep `LICENSE` with every redistributed copy, includin
 - Replace upstream type aliases with Oxlint's ESTree, context, token, comment, and rule types. Upstream's token type includes comments. Oxlint exposes them separately.
 - Replace `AST_NODE_TYPES` enum members with identical string literals.
 - Guard indexed reads for repositories that use `noUncheckedIndexedAccess`. Missing AST or configuration entries that should always exist raise invariant errors instead of using new non-null assertions.
-- Replace the repository-specific `createRule` factory with `createPaddingLineRule(options)`. The anti-slop wrapper supplies typed options directly and exposes no user configuration options.
+- Replace the repository-specific `createRule` factory with `createPaddingLineRule(options, statementTypes?)`. The anti-slop wrapper supplies typed options directly and exposes no user configuration options. The optional second argument registers caller-defined statement types. They are checked before the upstream table, so a policy can match syntax the upstream matchers don't tell apart, such as exported bindings or which statement a comment belongs to, without editing the vendored tables.
 - Implement the required AST helpers in `padding-line-ast.ts` using Oxlint's public source-code and token API. `isParenthesized` checks one pair of parentheses to exclude parenthesized directive strings. It does not need the upstream general-purpose overloads.
 - Retain the upstream statement matchers, scope tracking, comment-aware insertion and removal, selector support, and diagnostic text. Keep upstream naming and non-null assumptions in this file so future diffs remain reviewable. Do not use it as a model for new application code.
 

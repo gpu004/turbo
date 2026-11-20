@@ -14,7 +14,7 @@ A turbo lint rule bans an operation everywhere and is turned off only for the mo
 
 ## Rules code can't enforce yet
 
-- `QueueFile` in `src/model.ts` is a stored format that running brokers read from R2. You can add an optional field. Renaming or removing a field, or changing what it means, needs a new `version` and a reader for the old one. The schema can check a file's shape, but not whether a change is compatible with files already stored.
+- `QueueFile` in `src/model.ts` is a stored format that running brokers read from R2. You can add an optional field. Renaming or removing a field, or changing what it means, needs a new `version` and a reader for the old one. The schema can check a file's shape, but not whether a change is compatible with files already stored. Build every object schema in it with `storedStruct`, so fields written by a newer broker survive a rewrite by an older one.
 - If you change how `src/broker.ts` loads, caches, or writes the queue, update `spec/QueueBroker.tla` in the same change. Nothing links the spec to the code, so they can drift apart unnoticed.
 - `readme.md` is the API contract for clients. Update it when a route, status code, response shape, or guarantee changes.
 

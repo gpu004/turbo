@@ -21,6 +21,10 @@
       "specifier": "./tools/oxlint/anti-slop/index.ts"
     },
     {
+      "name": "anti-slop-effect",
+      "specifier": "./tools/oxlint/anti-slop/effect/index.ts"
+    },
+    {
       "name": "turbo",
       "specifier": "./tools/oxlint/turbo/index.ts"
     }
@@ -48,6 +52,11 @@
     "anti-slop/no-widen-then-assert": "error",
     "anti-slop/require-readable-spacing": "error",
     "anti-slop/require-safety-comment-for-type-assertion": "error",
+    "anti-slop-effect/no-manual-effect-error-tag": "error",
+    "anti-slop-effect/no-manual-tag-comparison": "error",
+    "anti-slop-effect/no-manual-tagged-construction": "error",
+    "anti-slop-effect/no-service-constructor-imports": "error",
+    "anti-slop-effect/prefer-effect-match": "error",
     "turbo/no-ambient-effects": "error",
     "turbo/no-json-parse": "error",
     "turbo/no-raw-env-vars": [
@@ -64,8 +73,7 @@
     {
       "files": ["src/domain.ts"],
       "rules": {
-        "turbo/no-ambient-effects": "off",
-        "turbo/no-json-parse": "off"
+        "turbo/no-ambient-effects": "off"
       }
     },
     {

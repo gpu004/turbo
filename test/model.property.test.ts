@@ -1,3 +1,4 @@
+import { Effect } from "effect";
 import fc from "fast-check";
 import { describe, expect, it } from "vitest";
 import {
@@ -22,15 +23,15 @@ import {
 // Random workloads against the pure queue model. Each property states one of
 // the guarantees in readme.md exactly, in both directions where it applies.
 
-const BASE = Instant.parse("2026-08-31T12:00:00.000Z");
+const BASE = Instant.make("2026-08-31T12:00:00.000Z");
 
 const LEASE_SECONDS = 30;
 
-const QUEUE = QueueName.parse("property");
+const QUEUE = QueueName.make("property");
 
-const GHOST_JOB = JobId.parse("ghost-job");
+const GHOST_JOB = JobId.make("ghost-job");
 
-const FORGED_TOKEN = LeaseToken.parse("forged-token");
+const FORGED_TOKEN = LeaseToken.make("forged-token");
 
 // Intents pick jobs and tokens by index, so a generated sequence can refer to
 // jobs that only exist once earlier steps have run.
@@ -110,7 +111,11 @@ describe("queue model properties", () => {
     fc.assert(
       fc.property(workloadArbitrary, (intents) => {
         const sequential = runSequentially(intents);
-        const batch = applyBatch(emptyQueue(QUEUE, BASE), sequential.mutations, tokenSource());
+
+        const batch = Effect.runSync(
+          applyBatch(emptyQueue(QUEUE, BASE), sequential.mutations, tokenSource()),
+        );
+
         const last = sequential.steps.at(-1)?.after;
 
         expect(batch.results).toEqual(sequential.steps.map((step) => step.result));
@@ -134,7 +139,7 @@ function runSequentially(intents: readonly Intent[]): Run {
     now = addSeconds(now, intent.advance);
 
     const mutation = toMutation(intent, index, now, jobIds, tokens);
-    const applied = applyBatch(file, [mutation], newLeaseToken);
+    const applied = Effect.runSync(applyBatch(file, [mutation], newLeaseToken));
     const result = applied.results[0];
 
     if (!result) throw new Error("applyBatch returned no result for a single mutation");
@@ -162,8 +167,8 @@ function toMutation(
     case "push":
       return {
         kind: "push",
-        id: JobId.parse(`job-${index}`),
-        idempotencyKey: intent.key === null ? undefined : IdempotencyKey.parse(`key-${intent.key}`),
+        id: JobId.make(`job-${index}`),
+        idempotencyKey: intent.key === null ? undefined : IdempotencyKey.make(`key-${intent.key}`),
         payload: { index },
         now,
       };
@@ -171,7 +176,7 @@ function toMutation(
     case "claim":
       return {
         kind: "claim",
-        workerId: WorkerId.parse(`worker-${intent.worker}`),
+        workerId: WorkerId.make(`worker-${intent.worker}`),
         maxJobs: intent.maxJobs,
         leaseSeconds: LEASE_SECONDS,
         now,
@@ -264,6 +269,6 @@ function tokenSource(): () => LeaseToken {
   return () => {
     issued += 1;
 
-    return LeaseToken.parse(`token-${issued}`);
+    return LeaseToken.make(`token-${issued}`);
   };
 }

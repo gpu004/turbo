@@ -1,174 +1,253 @@
+import {
+  Cause,
+  Context,
+  Data,
+  Effect,
+  Layer,
+  Logger,
+  Schema,
+  SchemaIssue,
+  SchemaTransformation,
+  Stream,
+} from "effect";
 import { QueueBroker } from "./broker";
-import { parseConfig, type Config } from "./config";
+import { Settings } from "./config";
 import {
   IdempotencyKey,
   JobId,
-  JsonValueSchema,
+  JsonText,
+  JsonValue,
   LeaseToken,
-  parseJson,
   QueueName,
   WorkerId,
 } from "./domain";
 import type { MutationResult, QueueFile } from "./model";
 import { route, type Route } from "./router";
 import { decode, encode, type Encoded } from "./rpc";
-import { z } from "zod";
 
 export { QueueBroker };
 
 const requestObjectError = "request body must be a JSON object";
 
-const invalidPayloadError = "payload is required";
+const maxJobsError = "maxJobs must be an integer from 1 to 100";
 
-const PushBodySchema = z.object(
-  {
-    payload: JsonValueSchema,
-    idempotencyKey: z.string().optional().catch(undefined),
-  },
-  { error: requestObjectError },
-);
+const PushBodySchema = Schema.Struct({
+  payload: JsonValue.pipe(Schema.annotateKey({ messageMissingKey: "payload is required" })),
+  idempotencyKey: Schema.optionalKey(
+    Schema.String.pipe(Schema.catchDecoding(() => Effect.succeedNone)),
+  ),
+}).annotate({ message: requestObjectError });
 
-const ClaimBodySchema = z.object(
-  {
-    workerId: stringField("workerId", 200).pipe(WorkerId),
-    maxJobs: z
-      .number({ error: "maxJobs must be an integer from 1 to 100" })
-      .int("maxJobs must be an integer from 1 to 100")
-      .min(1, "maxJobs must be an integer from 1 to 100")
-      .max(100, "maxJobs must be an integer from 1 to 100")
-      .default(1),
-  },
-  { error: requestObjectError },
-);
+const ClaimBodySchema = Schema.Struct({
+  workerId: stringField("workerId", 200, WorkerId),
+  maxJobs: Schema.Number.annotate({ message: maxJobsError }).pipe(
+    Schema.check(
+      Schema.isInt({ message: maxJobsError }),
+      Schema.isBetween({ minimum: 1, maximum: 100 }, { message: maxJobsError }),
+    ),
+    Schema.withDecodingDefaultKey(Effect.succeed(1)),
+  ),
+}).annotate({ message: requestObjectError });
 
-const LeaseBodySchema = z.object(
-  { leaseToken: stringField("leaseToken", 200).pipe(LeaseToken) },
-  { error: requestObjectError },
-);
+const LeaseBodySchema = Schema.Struct({
+  leaseToken: stringField("leaseToken", 200, LeaseToken),
+}).annotate({ message: requestObjectError });
 
-class HttpError extends Error {
-  constructor(
-    readonly status: number,
-    readonly code: string,
-    message: string,
-  ) {
-    super(message);
+// A failure the client caused. It becomes a JSON error response; anything
+// else becomes a logged 500.
+class HttpError extends Data.TaggedError("HttpError")<{
+  readonly status: number;
+  readonly code: string;
+  readonly message: string;
+}> {}
+
+class BrokerCallFailed extends Data.TaggedError("BrokerCallFailed")<{
+  readonly message: string;
+}> {}
+
+class BodyReadFailed extends Data.TaggedError("BodyReadFailed")<{
+  readonly message: string;
+}> {}
+
+type BrokerStub = DurableObjectStub<QueueBroker>;
+
+class Brokers extends Context.Service<
+  Brokers,
+  { readonly forQueue: (queue: QueueName) => BrokerStub }
+>()("turbo/Brokers") {
+  static fromNamespace(namespace: DurableObjectNamespace<QueueBroker>): Layer.Layer<Brokers> {
+    return Layer.succeed(Brokers, { forQueue: (queue) => namespace.getByName(queue) });
   }
 }
 
-interface RequestContext {
-  readonly request: Request;
-  readonly env: Env;
-  readonly config: Config;
-}
+type RequestError = HttpError | BrokerCallFailed | BodyReadFailed;
 
-const routes: ReadonlyArray<Route<RequestContext>> = [
-  route("GET", "/health", async () => json({ ok: true })),
+const routes: ReadonlyArray<Route<Request, RequestError, Settings | Brokers>> = [
+  route("GET", "/health", () => Effect.succeed(json({ ok: true }))),
 
-  route("GET", "/queues/:queue", async ({ env }, params) => {
-    const queue = pathParam(QueueName, params.queue, "invalid_queue");
+  route("GET", "/queues/:queue", (_request, params) =>
+    Effect.gen(function* () {
+      const queue = yield* pathParam(QueueName, params.queue, "invalid_queue");
 
-    return jsonText(await env.QUEUE_BROKER.getByName(queue).inspect(queue));
-  }),
-
-  route("POST", "/queues/:queue/jobs", async ({ request, env, config }, params) => {
-    const queue = pathParam(QueueName, params.queue, "invalid_queue");
-    const input = await readJson(request, config, PushBodySchema);
-    const rawKey = request.headers.get("idempotency-key")?.trim() || input.idempotencyKey?.trim();
-    const idempotencyKey = rawKey ? parseIdempotencyKey(rawKey) : undefined;
-
-    const result = decode(
-      await env.QUEUE_BROKER.getByName(queue).push(queue, encode(input.payload), idempotencyKey),
-    );
-
-    return json(result, result.duplicate ? 200 : 201);
-  }),
-
-  route("POST", "/queues/:queue/claims", async ({ request, env, config }, params) => {
-    const queue = pathParam(QueueName, params.queue, "invalid_queue");
-    const input = await readJson(request, config, ClaimBodySchema);
-
-    return jsonText(
-      await env.QUEUE_BROKER.getByName(queue).claim(queue, input.workerId, input.maxJobs),
-    );
-  }),
-
-  route(
-    "POST",
-    "/queues/:queue/jobs/:jobId/heartbeat",
-    async ({ request, env, config }, params) => {
-      const queue = pathParam(QueueName, params.queue, "invalid_queue");
-      const jobId = pathParam(JobId, params.jobId, "invalid_job_id");
-      const input = await readJson(request, config, LeaseBodySchema);
-
-      return mutationResponse(
-        decode(await env.QUEUE_BROKER.getByName(queue).heartbeat(queue, jobId, input.leaseToken)),
-      );
-    },
+      return jsonText(yield* callBroker(queue, (broker) => broker.inspect(queue)));
+    }),
   ),
 
-  route("POST", "/queues/:queue/jobs/:jobId/complete", async ({ request, env, config }, params) => {
-    const queue = pathParam(QueueName, params.queue, "invalid_queue");
-    const jobId = pathParam(JobId, params.jobId, "invalid_job_id");
-    const input = await readJson(request, config, LeaseBodySchema);
+  route("POST", "/queues/:queue/jobs", (request, params) =>
+    Effect.gen(function* () {
+      const queue = yield* pathParam(QueueName, params.queue, "invalid_queue");
+      const input = yield* readJson(request, PushBodySchema);
+      const rawKey = request.headers.get("idempotency-key")?.trim() || input.idempotencyKey?.trim();
+      const idempotencyKey = rawKey ? yield* parseIdempotencyKey(rawKey) : undefined;
 
-    return mutationResponse(
-      decode(await env.QUEUE_BROKER.getByName(queue).complete(queue, jobId, input.leaseToken)),
-    );
-  }),
-];
-
-export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
-    try {
-      const segments = parseSegments(new URL(request.url).pathname);
-      const context: RequestContext = { request, env, config: parseConfig(env) };
-
-      for (const candidate of routes) {
-        const handle = candidate.match(request.method, segments);
-
-        if (handle) return await handle(context);
-      }
-
-      throw new HttpError(404, "not_found", "route not found");
-    } catch (error) {
-      if (error instanceof HttpError) {
-        return json({ error: { code: error.code, message: error.message } }, error.status);
-      }
-
-      console.error(
-        JSON.stringify({
-          level: "error",
-          event: "request_failed",
-          method: request.method,
-          path: new URL(request.url).pathname,
-          error: error instanceof Error ? error.message : String(error),
-        }),
+      const result = decode(
+        yield* callBroker(queue, (broker) =>
+          broker.push(queue, encode(input.payload), idempotencyKey),
+        ),
       );
 
-      return json({ error: { code: "internal_error", message: "queue operation failed" } }, 500);
-    }
+      return json(result, result.duplicate ? 200 : 201);
+    }),
+  ),
+
+  route("POST", "/queues/:queue/claims", (request, params) =>
+    Effect.gen(function* () {
+      const queue = yield* pathParam(QueueName, params.queue, "invalid_queue");
+      const input = yield* readJson(request, ClaimBodySchema);
+
+      return jsonText(
+        yield* callBroker(queue, (broker) => broker.claim(queue, input.workerId, input.maxJobs)),
+      );
+    }),
+  ),
+
+  route("POST", "/queues/:queue/jobs/:jobId/heartbeat", (request, params) =>
+    Effect.gen(function* () {
+      const queue = yield* pathParam(QueueName, params.queue, "invalid_queue");
+      const jobId = yield* pathParam(JobId, params.jobId, "invalid_job_id");
+      const input = yield* readJson(request, LeaseBodySchema);
+
+      return mutationResponse(
+        decode(
+          yield* callBroker(queue, (broker) => broker.heartbeat(queue, jobId, input.leaseToken)),
+        ),
+      );
+    }),
+  ),
+
+  route("POST", "/queues/:queue/jobs/:jobId/complete", (request, params) =>
+    Effect.gen(function* () {
+      const queue = yield* pathParam(QueueName, params.queue, "invalid_queue");
+      const jobId = yield* pathParam(JobId, params.jobId, "invalid_job_id");
+      const input = yield* readJson(request, LeaseBodySchema);
+
+      return mutationResponse(
+        decode(
+          yield* callBroker(queue, (broker) => broker.complete(queue, jobId, input.leaseToken)),
+        ),
+      );
+    }),
+  ),
+];
+
+const errorLogger = Logger.layer([Logger.withConsoleError(Logger.formatJson)]);
+
+export default {
+  fetch(request: Request, env: Env): Promise<Response> {
+    return Effect.runPromise(
+      handleRequest(request).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            Settings.fromEnv(env),
+            Brokers.fromNamespace(env.QUEUE_BROKER),
+            errorLogger,
+          ),
+        ),
+      ),
+    );
   },
 } satisfies ExportedHandler<Env>;
 
-function pathParam<S extends z.ZodType>(schema: S, value: string, code: string): z.output<S> {
-  const parsed = schema.safeParse(value);
+function handleRequest(request: Request): Effect.Effect<Response, never, Settings | Brokers> {
+  const path = new URL(request.url).pathname;
 
-  if (!parsed.success) {
-    throw new HttpError(400, code, parsed.error.issues[0]?.message ?? `${code} in path`);
-  }
+  return Effect.gen(function* () {
+    const segments = yield* parseSegments(path);
 
-  return parsed.data;
+    for (const candidate of routes) {
+      const handle = candidate.match(request.method, segments);
+
+      if (handle) return yield* handle(request);
+    }
+
+    return yield* new HttpError({ status: 404, code: "not_found", message: "route not found" });
+  }).pipe(
+    Effect.catchTag("HttpError", (error) =>
+      Effect.succeed(json({ error: { code: error.code, message: error.message } }, error.status)),
+    ),
+    Effect.catchCause((cause) => {
+      const error = Cause.squash(cause);
+
+      return Effect.logError("request_failed").pipe(
+        Effect.annotateLogs({
+          method: request.method,
+          path,
+          error: error instanceof Error ? error.message : String(error),
+        }),
+        Effect.as(
+          json({ error: { code: "internal_error", message: "queue operation failed" } }, 500),
+        ),
+      );
+    }),
+  );
 }
 
-function parseIdempotencyKey(value: string): IdempotencyKey {
-  const parsed = IdempotencyKey.safeParse(value);
+function callBroker<A>(
+  queue: QueueName,
+  call: (broker: BrokerStub) => Promise<A>,
+): Effect.Effect<A, BrokerCallFailed, Brokers> {
+  return Brokers.use((brokers) =>
+    Effect.tryPromise({
+      try: () => call(brokers.forQueue(queue)),
+      catch: (error) =>
+        new BrokerCallFailed({ message: error instanceof Error ? error.message : String(error) }),
+    }),
+  );
+}
 
-  if (!parsed.success) {
-    throw new HttpError(400, "invalid_idempotency_key", "idempotency key is too long");
-  }
+// The first issue's message, which is the one a client sees.
+function firstIssueMessage(error: Schema.SchemaError): string | undefined {
+  return SchemaIssue.makeFormatterStandardSchemaV1()(error.issue).issues[0]?.message;
+}
 
-  return parsed.data;
+function pathParam<A>(
+  schema: Schema.Codec<A, string>,
+  value: string,
+  code: string,
+): Effect.Effect<A, HttpError> {
+  return Schema.decodeEffect(schema)(value).pipe(
+    Effect.mapError(
+      (error) =>
+        new HttpError({
+          status: 400,
+          code,
+          message: firstIssueMessage(error) ?? `${code} in path`,
+        }),
+    ),
+  );
+}
+
+function parseIdempotencyKey(value: string): Effect.Effect<IdempotencyKey, HttpError> {
+  return Schema.decodeEffect(IdempotencyKey)(value).pipe(
+    Effect.mapError(
+      () =>
+        new HttpError({
+          status: 400,
+          code: "invalid_idempotency_key",
+          message: "idempotency key is too long",
+        }),
+    ),
+  );
 }
 
 function mutationResponse(result: MutationResult): Response {
@@ -178,70 +257,111 @@ function mutationResponse(result: MutationResult): Response {
   return json({ error: { code: result.code, message: result.message } }, status);
 }
 
-async function readJson<T>(request: Request, config: Config, schema: z.ZodType<T>): Promise<T> {
-  if (!request.body) throw new HttpError(400, "invalid_json", "JSON request body is required");
+function readJson<A>(
+  request: Request,
+  schema: Schema.Codec<A, JsonValue>,
+): Effect.Effect<A, HttpError | BodyReadFailed, Settings> {
+  return Effect.gen(function* () {
+    const body = request.body;
 
-  const maxBytes = config.maxRequestBytes;
-  const declaredLength = Number.parseInt(request.headers.get("content-length") ?? "", 10);
-
-  if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
-    throw new HttpError(413, "body_too_large", `request body exceeds ${maxBytes} bytes`);
-  }
-
-  const reader = request.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let received = 0;
-
-  while (true) {
-    const { done, value } = await reader.read();
-
-    if (done) break;
-    received += value.byteLength;
-
-    if (received > maxBytes) {
-      await reader.cancel();
-      throw new HttpError(413, "body_too_large", `request body exceeds ${maxBytes} bytes`);
+    if (!body) {
+      return yield* new HttpError({
+        status: 400,
+        code: "invalid_json",
+        message: "JSON request body is required",
+      });
     }
 
-    chunks.push(value);
-  }
+    const { maxRequestBytes: maxBytes } = yield* Settings;
 
-  const bytes = new Uint8Array(received);
-  let offset = 0;
+    const tooLarge = new HttpError({
+      status: 413,
+      code: "body_too_large",
+      message: `request body exceeds ${maxBytes} bytes`,
+    });
 
-  for (const chunk of chunks) {
-    bytes.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
+    const declaredLength = Number.parseInt(request.headers.get("content-length") ?? "", 10);
 
-  const json = parseJson(new TextDecoder().decode(bytes));
+    if (Number.isFinite(declaredLength) && declaredLength > maxBytes) return yield* tooLarge;
 
-  if (!json.ok) throw new HttpError(400, "invalid_json", "request body is not valid JSON");
+    const chunks: Uint8Array[] = [];
+    let received = 0;
 
-  const parsed = schema.safeParse(json.value);
+    // Failing the stream cancels the reader, so an oversized body is not read
+    // to the end.
+    yield* Stream.fromReadableStream({
+      evaluate: () => body,
+      onError: (error) => new BodyReadFailed({ message: String(error) }),
+    }).pipe(
+      Stream.runForEach((chunk) => {
+        received += chunk.byteLength;
 
-  if (!parsed.success) {
-    const issue = parsed.error.issues[0];
-    const message = issue?.path[0] === "payload" ? invalidPayloadError : issue?.message;
+        if (received > maxBytes) return Effect.fail(tooLarge);
 
-    throw new HttpError(400, "invalid_body", message ?? "request body is invalid");
-  }
+        chunks.push(chunk);
 
-  return parsed.data;
+        return Effect.void;
+      }),
+    );
+
+    const bytes = new Uint8Array(received);
+    let offset = 0;
+
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+
+    const json = yield* Schema.decodeEffect(JsonText)(new TextDecoder().decode(bytes)).pipe(
+      Effect.mapError(
+        () =>
+          new HttpError({
+            status: 400,
+            code: "invalid_json",
+            message: "request body is not valid JSON",
+          }),
+      ),
+    );
+
+    return yield* Schema.decodeEffect(schema)(json).pipe(
+      Effect.mapError(
+        (error) =>
+          new HttpError({
+            status: 400,
+            code: "invalid_body",
+            message: firstIssueMessage(error) ?? "request body is invalid",
+          }),
+      ),
+    );
+  });
 }
 
-function parseSegments(pathname: string): string[] {
-  try {
-    return pathname.split("/").filter(Boolean).map(decodeURIComponent);
-  } catch {
-    throw new HttpError(400, "invalid_path", "path contains invalid percent encoding");
-  }
+function parseSegments(pathname: string): Effect.Effect<string[], HttpError> {
+  return Effect.try({
+    try: () => pathname.split("/").filter(Boolean).map(decodeURIComponent),
+    catch: () =>
+      new HttpError({
+        status: 400,
+        code: "invalid_path",
+        message: "path contains invalid percent encoding",
+      }),
+  });
 }
 
-function stringField(key: string, maxLength: number): z.ZodString {
+// A string field that is trimmed and then decoded as `target`. Every failure,
+// including a missing key, reports the same message.
+function stringField<A>(key: string, maxLength: number, target: Schema.Codec<A, string>) {
   const message = `${key} must be a non-empty string no longer than ${maxLength} characters`;
 
-  return z.string({ error: message }).max(maxLength, message).trim().min(1, message);
+  return Schema.String.annotate({ message }).pipe(
+    Schema.check(Schema.isMaxLength(maxLength, { message })),
+    Schema.decodeTo(
+      Schema.String.check(Schema.isNonEmpty({ message })),
+      SchemaTransformation.trim(),
+    ),
+    Schema.decodeTo(target),
+    Schema.annotateKey({ messageMissingKey: message }),
+  );
 }
 
 type JsonResponseBody =

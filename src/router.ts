@@ -1,3 +1,5 @@
+import type { Effect } from "effect";
+
 // A route is declared once as a pattern such as "/queues/:queue/jobs/:jobId".
 // The handler's `params` type is derived from that pattern, so a handler can
 // only read parameters its route actually captures.
@@ -12,18 +14,18 @@ export type RouteParams<P extends string> = { readonly [K in ParamName<P>]: stri
 
 export type Method = "GET" | "POST";
 
-export interface Route<C> {
+export interface Route<C, E, R> {
   readonly match: (
     method: string,
     segments: readonly string[],
-  ) => ((context: C) => Promise<Response>) | undefined;
+  ) => ((context: C) => Effect.Effect<Response, E, R>) | undefined;
 }
 
-export function route<P extends string, C>(
+export function route<P extends string, C, E, R>(
   method: Method,
   pattern: P,
-  handle: (context: C, params: RouteParams<P>) => Promise<Response>,
-): Route<C> {
+  handle: (context: C, params: RouteParams<P>) => Effect.Effect<Response, E, R>,
+): Route<C, E, R> {
   const parts = pattern.split("/").filter(Boolean);
 
   return {

@@ -47,7 +47,7 @@ const noAmbientEffectsRule = defineRule({
     },
     messages: {
       ambient:
-        "`{{name}}` reads the clock or randomness. Use `currentInstant`, `addSeconds`, `newJobId`, or `newLeaseToken` from src/domain.ts, or accept the value as a parameter.",
+        "`{{name}}` reads the clock or randomness. Use `currentInstant` or the `Ids` service from src/domain.ts, or accept the value as a parameter.",
     },
   },
   createOnce(context) {
@@ -76,14 +76,14 @@ const noAmbientEffectsRule = defineRule({
   },
 });
 
-/** Untrusted JSON text is parsed in one place and then validated by a schema. */
+/** Untrusted JSON text is decoded by a schema, never parsed and trusted. */
 const noJsonParseRule = defineRule({
   meta: {
     type: "problem",
-    docs: { description: "Disallow JSON.parse outside the JSON boundary modules." },
+    docs: { description: "Disallow JSON.parse outside the broker RPC boundary." },
     messages: {
       jsonParse:
-        "Use `parseJson` from src/domain.ts, then validate the value with a zod schema. For broker RPC values use `decode` from src/rpc.ts.",
+        "Decode JSON text with `JsonText` from src/domain.ts, then decode the value with an Effect schema. For broker RPC values use `decode` from src/rpc.ts.",
     },
   },
   createOnce(context) {
@@ -116,7 +116,7 @@ function configuredBindings(option: unknown): ReadonlySet<string> {
   return new Set(option.bindings.flatMap((value) => (typeof value === "string" ? [value] : [])));
 }
 
-/** Env vars are strings; read them through the parsed `Config` instead. */
+/** Env vars are strings; read them through the `Settings` service instead. */
 const noRawEnvVarsRule = defineRule({
   meta: {
     type: "problem",
@@ -126,7 +126,7 @@ const noRawEnvVarsRule = defineRule({
     },
     messages: {
       rawEnv:
-        "`env.{{name}}` is an unparsed string. Add it to the schema in src/config.ts and read the typed `Config` field instead.",
+        "`env.{{name}}` is an unparsed string. Add it to src/config.ts and read the typed field from the `Settings` service instead.",
     },
     schema: [
       {
@@ -156,7 +156,7 @@ const noRawEnvVarsRule = defineRule({
 // file means changing this list, which a reviewer will see.
 export const RULE_OWNERS: Readonly<Record<string, readonly string[]>> = {
   "no-ambient-effects": ["src/domain.ts"],
-  "no-json-parse": ["src/domain.ts", "src/rpc.ts"],
+  "no-json-parse": ["src/rpc.ts"],
   "no-raw-env-vars": ["src/config.ts"],
 };
 
