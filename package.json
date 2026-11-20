@@ -20,14 +20,14 @@
     "effect": "4.1.4"
   },
   "devDependencies": {
-    "@cloudflare/vitest-plugin": "1.1.7",
+    "@cloudflare/vitest-plugin": "1.8.3",
     "@oxlint/plugins": "1.80.0",
     "@types/node": "^24.3.0",
     "fast-check": "4.10.2",
-    "oxfmt": "^0.65.0",
+    "oxfmt": "^0.79.0",
     "oxlint": "^1.80.0",
     "typescript": "^7.0.2",
     "vitest": "^4.1.11",
-    "wrangler": "4.131.0"
+    "wrangler": "4.163.0"
   }
 }
