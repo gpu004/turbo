@@ -53,8 +53,6 @@ const LeaseBodySchema = Schema.Struct({
   leaseToken: stringField("leaseToken", 200, LeaseToken),
 }).annotate({ message: requestObjectError });
 
-// A failure the client caused. It becomes a JSON error response; anything
-// else becomes a logged 500.
 class HttpError extends Data.TaggedError("HttpError")<{
   readonly status: number;
   readonly code: string;
@@ -225,7 +223,6 @@ function callBroker<A>(
   );
 }
 
-// The first issue's message, which is the one a client sees.
 function firstIssueMessage(error: Schema.SchemaError): string | undefined {
   return SchemaIssue.makeFormatterStandardSchemaV1()(error.issue).issues[0]?.message;
 }
@@ -271,8 +268,6 @@ function mutationResponse(
   return Effect.succeed(json({ error: { code: result.code, message: result.message } }, status));
 }
 
-// The broker writes at most once per QUEUE_COMMIT_INTERVAL_MS, so that is the
-// earliest a retry can land in a new commit.
 function unavailableResponse(result: Unavailable): Effect.Effect<Response, never, Settings> {
   return Settings.use(({ commitIntervalMs }) =>
     Effect.succeed(
@@ -313,8 +308,6 @@ function readJson<A>(
     const chunks: Uint8Array[] = [];
     let received = 0;
 
-    // Failing the stream cancels the reader, so an oversized body is not read
-    // to the end.
     yield* Stream.fromReadableStream({
       evaluate: () => body,
       onError: (error) => new BodyReadFailed({ message: String(error) }),
@@ -374,8 +367,6 @@ function parseSegments(pathname: string): Effect.Effect<string[], HttpError> {
   });
 }
 
-// A string field that is trimmed and then decoded as `target`. Every failure,
-// including a missing key, reports the same message.
 function stringField<A>(key: string, maxLength: number, target: Schema.Codec<A, string>) {
   const message = `${key} must be a non-empty string no longer than ${maxLength} characters`;
 
@@ -406,7 +397,6 @@ function json(
   });
 }
 
-// Sends a broker response as-is. The response body is the JSON text of `T`.
 function jsonText<T extends JsonResponseBody | PublicQueueFile>(
   value: Encoded<T>,
   status = 200,

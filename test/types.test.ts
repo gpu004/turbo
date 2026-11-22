@@ -12,10 +12,6 @@ import {
 } from "../src/model";
 import { route } from "../src/router";
 
-// Each `@ts-expect-error` below is a mistake the types must reject. If one ever
-// compiles, `tsc --noEmit` fails on the unused directive, so CI catches the
-// regression even though nothing here runs.
-
 const now = Instant.make("2026-08-31T12:00:00.000Z");
 
 const jobId = JobId.make("job-1");

@@ -3,9 +3,6 @@ import { beforeAll, describe, expect, it } from "vitest";
 import type { JsonValue } from "../src/domain";
 
 describe("queue Worker", () => {
-  // The first request boots workerd, the Durable Object, and local R2, which can
-  // take several seconds. Pay that once here so each test keeps the default
-  // timeout and a hang inside a test still fails fast.
   beforeAll(async () => {
     const warmup = await exports.default.fetch("https://queue.test/queues/warmup");
     expect(warmup.status).toBe(200);

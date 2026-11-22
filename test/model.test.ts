@@ -405,8 +405,6 @@ function complete(jobId: string, leaseToken: string, now: Instant): QueueMutatio
   };
 }
 
-// Hands out the given lease tokens in order, and fails the test if the model
-// asks for more than it was given.
 function tokens(...values: string[]): () => LeaseToken {
   const queue = values.map((value) => LeaseToken.make(value));
 

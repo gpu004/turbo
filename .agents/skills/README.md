@@ -5,5 +5,6 @@ Vendored from [cursor/plugins](https://github.com/cursor/plugins) at `1dcc2ba` (
 | Skill | Source |
 | --- | --- |
 | create-verification-skill (+ references/feature-map-example), maintain-verification-skill | `pstack/skills` |
+| delete-comment | Local |
 
-Both run on request only: `/create-verification-skill` generates `.agents/skills/verify-<app>/`, `/maintain-verification-skill` audits it.
+All run on request only: `/create-verification-skill` generates `.agents/skills/verify-<app>/`, `/maintain-verification-skill` audits it, and `/delete-comment` audits code comments and tightens the `turbo/no-comments` ratchet.

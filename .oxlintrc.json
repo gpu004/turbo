@@ -58,6 +58,12 @@
     "anti-slop-effect/no-service-constructor-imports": "error",
     "anti-slop-effect/prefer-effect-match": "error",
     "turbo/no-ambient-effects": "error",
+    "turbo/no-comments": [
+      "error",
+      {
+        "maxCommentsByFile": {}
+      }
+    ],
     "turbo/no-json-parse": "error",
     "turbo/no-raw-env-vars": [
       "error",

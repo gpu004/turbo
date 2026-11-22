@@ -1,9 +1,5 @@
 import type { Effect } from "effect";
 
-// A route is declared once as a pattern such as "/queues/:queue/jobs/:jobId".
-// The handler's `params` type is derived from that pattern, so a handler can
-// only read parameters its route actually captures.
-
 type ParamName<P extends string> = P extends `${infer Head}/${infer Tail}`
   ? ParamName<Head> | ParamName<Tail>
   : P extends `:${infer Name}`
@@ -43,8 +39,7 @@ export function route<P extends string, C, E, R>(
         else if (part !== segment) return undefined;
       }
 
-      // SAFETY: `captured` holds exactly one entry for each `:name` part of
-      // `pattern`, and `ParamName<P>` is the set of those same names.
+      /* SAFETY: `captured` holds exactly one entry for each `:name` part of `pattern`, and `ParamName<P>` is the set of those same names. */
       const params = Object.fromEntries(captured) as RouteParams<P>;
 
       return (context) => handle(context, params);

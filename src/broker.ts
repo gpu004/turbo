@@ -48,10 +48,6 @@ import {
   type Shedding,
 } from "./model";
 
-// R2 ends an error message with its numeric code. These codes mean the same
-// request may succeed later: too many requests (R2 takes about one write per
-// second to a key), internal error, service unavailable, and client
-// disconnected. https://developers.cloudflare.com/r2/api/error-codes/
 const RETRYABLE_R2_CODE = /\((?:10058|10001|10043|10054)\)\s*$/u;
 
 export class StorageFailure extends Data.TaggedError("StorageFailure")<{
@@ -95,8 +91,6 @@ type CommitError =
 
 export type BrokerError = CommitError | QueueBindingConflict | Overloaded;
 
-// What the Durable Object returns instead of failing when the queue cannot
-// take more work right now. The Worker answers it with 503 and Retry-After.
 export interface Unavailable {
   readonly ok: false;
   readonly kind: "unavailable";
@@ -109,9 +103,6 @@ export interface StoredQueue {
   readonly etag: string;
 }
 
-// The R2 object that holds one queue. `put` writes only if the object still
-// has `etag`, or does not exist yet when `etag` is none. It succeeds with the
-// new etag, or with none when R2 holds a different version.
 export class QueueStore extends Context.Service<
   QueueStore,
   {
@@ -157,8 +148,6 @@ export class QueueStore extends Context.Service<
   }
 }
 
-// Runs work that must finish after the request that started it has been
-// answered. In a Durable Object that means `ctx.waitUntil`.
 export class Background extends Context.Service<
   Background,
   { readonly run: (work: Effect.Effect<void>) => Effect.Effect<void> }
@@ -180,25 +169,15 @@ interface Snapshot {
   readonly etag: Option.Option<string>;
 }
 
-// A queued mutation, erased to a uniform type so different kinds can share one
-// batch. `apply` runs the mutation against a draft and returns the effect that
-// delivers its typed result; the result type never leaves the closure.
-//
-// `now` is the time of the commit attempt, not of the request. A command can
-// wait a commit interval or more before it is applied, and a lease must start
-// when it is written.
 interface PendingCommand {
   readonly apply: (draft: QueueDraft, now: Instant) => Effect.Effect<void>;
   readonly fail: (cause: Cause.Cause<CommitError>) => Effect.Effect<void>;
-  // Payload bytes this command holds in memory until it commits.
   readonly bytes: number;
 }
 
 interface FlushState {
   readonly pending: readonly PendingCommand[];
   readonly pendingBytes: number;
-  // Completes when the running flush loop has drained `pending`. Absent when
-  // no loop is running.
   readonly idle: Deferred.Deferred<void> | undefined;
 }
 
@@ -284,10 +263,6 @@ export class Broker extends Context.Service<
         return snapshot;
       });
 
-      // Applies the batch to the snapshot until the result fits in
-      // MAX_QUEUE_BYTES, giving up what `planShedding` picks each time it does
-      // not. Every attempt starts again from the snapshot, so only the last
-      // attempt's results are delivered.
       const applyWithinLimit = Effect.fn(function* (
         snapshot: Snapshot,
         batch: readonly PendingCommand[],
@@ -316,8 +291,6 @@ export class Broker extends Context.Service<
         }
       });
 
-      // R2 takes about one write per second to the same key. Waits until
-      // QUEUE_COMMIT_INTERVAL_MS has passed since the last write started.
       const waitForTurn = Effect.gen(function* () {
         const last = yield* Ref.get(lastPutAt);
 
@@ -341,21 +314,11 @@ export class Broker extends Context.Service<
         return yield* store.put(queue, body, etag);
       });
 
-      // Applies the batch to the latest snapshot and writes it with an R2
-      // compare-and-set. A failed compare-and-set clears the snapshot, so the
-      // next attempt reloads from R2.
-      //
-      // A write that fails with an error may still have landed. `unconfirmed`
-      // keeps the deliveries of each such write by its commit id. If the
-      // reloaded file carries one of those ids, that write landed, and its
-      // results are delivered instead of applying the batch a second time.
       const commitOnce = Effect.fn(function* (
         queue: QueueName,
         batch: readonly PendingCommand[],
         unconfirmed: Map<CommitId, readonly Effect.Effect<void>[]>,
       ) {
-        // Waiting before applying keeps a retry from stamping leases with a
-        // time that the wait in `pacedPut` would then eat into.
         yield* waitForTurn;
 
         const snapshot = yield* load(queue, false);
@@ -391,9 +354,6 @@ export class Broker extends Context.Service<
         return deliveries;
       });
 
-      // Results are delivered only after R2 accepts the write. A lost
-      // compare-and-set and a retryable R2 error are retried with jittered
-      // backoff, on top of the pacing in `pacedPut`.
       const commit = (queue: QueueName, batch: readonly PendingCommand[]) =>
         commitOnce(queue, batch, new Map()).pipe(
           Effect.retry({
@@ -415,12 +375,8 @@ export class Broker extends Context.Service<
           yield* Effect.sleep(settings.batchWindowMs);
 
           while (true) {
-            // Commands that arrive while the broker waits for its next write
-            // join the batch.
             yield* waitForTurn;
 
-            // Taking the batch and ending the loop are one step, so a command
-            // enqueued after the last batch always starts a new loop.
             const batch = yield* Ref.modify(
               flush,
               (state): [readonly PendingCommand[], FlushState] =>
@@ -465,9 +421,6 @@ export class Broker extends Context.Service<
           bytes,
         };
 
-        // Waiting payloads beyond MAX_QUEUE_BYTES could not fit in one commit
-        // anyway, and bounding them keeps a burst of large pushes from
-        // exhausting isolate memory.
         const queued = yield* Ref.modify(
           flush,
           (state): ["start" | "joined" | "full", FlushState] => {
@@ -499,7 +452,6 @@ export class Broker extends Context.Service<
 
       return {
         push: Effect.fn(function* (queue, payload, idempotencyKey) {
-          // One id for every attempt, so shedding and recovery see one job.
           const id = ids.newJobId();
 
           return yield* enqueue(
@@ -555,8 +507,6 @@ export class Broker extends Context.Service<
   );
 }
 
-// The Durable Object is only the RPC surface. Each method runs the `Broker`
-// service on a runtime that lives as long as the object.
 export class QueueBroker extends DurableObject<Env> {
   private readonly runtime: ManagedRuntime.ManagedRuntime<Broker, never>;
 
@@ -612,8 +562,6 @@ export class QueueBroker extends DurableObject<Env> {
     return this.run(Broker.use((broker) => broker.inspect(queue)));
   }
 
-  // Errors cannot cross the RPC boundary with their type, so the two the
-  // client should retry later travel as an `Unavailable` result.
   private mutate<A>(
     effect: Effect.Effect<A, BrokerError, Broker>,
   ): Promise<Encoded<A | Unavailable>> {
