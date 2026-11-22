@@ -21,14 +21,10 @@ import {
   type QueueMutation,
 } from "../src/model";
 
-// Random workloads against the pure queue model. Each property states one of
-// the guarantees in readme.md exactly, in both directions where it applies.
-
 const BASE = Instant.make("2026-08-31T12:00:00.000Z");
 
 const LEASE_SECONDS = 30;
 
-// Short enough that workloads see completed jobs expire.
 const RETAIN_SECONDS = 40;
 
 const QUEUE = QueueName.make("property");
@@ -37,8 +33,6 @@ const GHOST_JOB = JobId.make("ghost-job");
 
 const FORGED_TOKEN = LeaseToken.make("forged-token");
 
-// Intents pick jobs and tokens by index, so a generated sequence can refer to
-// jobs that only exist once earlier steps have run.
 type Intent =
   | { kind: "push"; key: number | null; advance: number }
   | { kind: "claim"; worker: number; maxJobs: number; advance: number }
@@ -296,8 +290,6 @@ function checkConservation({ before, mutation, result, after }: Step): void {
   expect(mutation.kind === "complete" || after.jobs.length >= before.jobs.length).toBe(true);
 }
 
-// Replays the workload's history of each idempotency key, independently of
-// how the model stores completed jobs.
 function checkIdempotency(steps: readonly Step[]): void {
   const history = new Map<string, { jobId: JobId; completedAt: Instant | undefined }>();
 

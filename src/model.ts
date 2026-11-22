@@ -28,8 +28,6 @@ interface JobFields {
   readonly attempts: number;
 }
 
-// A job either has a lease or it does not. There is no pending job with a
-// lease and no leased job without one.
 export interface PendingJob extends JobFields {
   readonly state: "pending";
 }
@@ -41,8 +39,6 @@ export interface LeasedJob extends JobFields {
 
 export type QueueJob = PendingJob | LeasedJob;
 
-// What anyone but the lease holder may see of a job. `token?: never` makes
-// handing a `LeasedJob` to a caller who did not claim it a type error.
 export interface PublicLease {
   readonly workerId: WorkerId;
   readonly heartbeatAt: Instant;
@@ -52,8 +48,6 @@ export interface PublicLease {
 
 export type PublicJob = PendingJob | (Omit<LeasedJob, "lease"> & { readonly lease: PublicLease });
 
-// A completed job, kept until `expiresAt` so a retried push with the same
-// idempotency key, or a repeated completion, is recognised.
 export interface CompletedJob {
   readonly jobId: JobId;
   readonly leaseToken: LeaseToken;
@@ -73,11 +67,8 @@ export interface QueueFile {
   };
   readonly revision: number;
   readonly updatedAt: Instant;
-  // Set by the commit that wrote this file, so a broker whose write failed
-  // ambiguously can tell on reload whether it landed. Absent in older files.
   readonly commitId?: CommitId;
   readonly jobs: readonly QueueJob[];
-  // Absent in files written before completed jobs were kept.
   readonly completed?: readonly CompletedJob[];
 }
 
@@ -86,8 +77,6 @@ export interface PublicQueueFile extends Omit<QueueFile, "jobs" | "completed"> {
   readonly completed?: readonly PublicCompletedJob[];
 }
 
-// Stored objects keep fields this version does not know about, so a broker
-// that rewrites a queue preserves fields a newer broker added.
 function storedStruct<const Fields extends Schema.Struct.Fields>(fields: Fields) {
   return Schema.StructWithRest(Schema.Struct(fields), [Schema.Record(Schema.String, JsonValue)]);
 }
@@ -136,8 +125,6 @@ const QueueFileSchema: Schema.Decoder<QueueFile> = storedStruct({
   Schema.makeFilter((file) => invariantViolation(file.jobs, supersede(file.jobs, file.completed))),
 );
 
-// Only the identity fields, so a file for another queue or format version is
-// reported as incompatible rather than malformed.
 const QueueIdentitySchema = Schema.Struct({ version: Schema.Literal(1), queue: Schema.String });
 
 export class MalformedQueueFile extends Data.TaggedError("MalformedQueueFile")<{
@@ -157,9 +144,6 @@ export class InvariantViolation extends Data.TaggedError("InvariantViolation")<{
   readonly message: string;
 }> {}
 
-// Invariants the types cannot express. They are checked when a queue is
-// loaded from R2 and again in `closeDraft`, before a file can be written, so a
-// model bug fails the commit instead of persisting a corrupt queue.
 export function invariantViolation(
   jobs: readonly QueueJob[],
   completed: readonly CompletedJob[] = [],
@@ -210,9 +194,6 @@ export function invariantViolation(
 
   return undefined;
 }
-
-// Each mutation kind maps to its input and its result. Adding a kind means
-// adding one entry to each map and one handler; the compiler finds the rest.
 
 interface MutationInputs {
   push: {
@@ -286,9 +267,6 @@ export type QueueMutation = MutationOf;
 
 export type MutationResult = ResultOf;
 
-// A draft is the working copy of one queue file during one group commit.
-// Jobs are immutable values; handlers replace array entries rather than
-// mutating jobs, so results handed back to callers never change underneath them.
 export interface QueueDraft {
   readonly source: QueueFile;
   readonly jobs: QueueJob[];
@@ -298,8 +276,6 @@ export interface QueueDraft {
   changedAt: Instant | undefined;
 }
 
-// What a commit gives up to fit within MAX_QUEUE_BYTES: pushes refused with
-// `queue_full`, by job id, and how many of the oldest completed jobs to drop.
 export interface Shedding {
   readonly refusedPushes: ReadonlySet<JobId>;
   readonly evictedCompleted: number;
@@ -346,7 +322,6 @@ const handlers: Handlers = {
       };
     }
 
-    // The key's completed job has expired, so the key is free again.
     if (completed) draft.completed.splice(completedIndex, 1);
 
     const fields: PendingJob = {
@@ -478,7 +453,6 @@ export function closeDraft(draft: QueueDraft): Effect.Effect<ClosedDraft, Invari
 
   if (changedAt === undefined) return Effect.succeed({ file: draft.source, changed: false });
 
-  // Completed jobs are kept in completion order, so the oldest come first.
   const completed = draft.completed
     .filter((job) => !isAtOrAfter(changedAt, job.expiresAt))
     .slice(draft.shed.evictedCompleted);
@@ -503,20 +477,12 @@ export function closeDraft(draft: QueueDraft): Effect.Effect<ClosedDraft, Invari
     jobs: draft.jobs,
   };
 
-  // An empty list is left out, so a queue that never completed a job keeps
-  // the file shape older brokers wrote.
   return Effect.succeed({
     file: completed.length === 0 ? file : { ...file, completed },
     changed: true,
   });
 }
 
-// Picks what to give up when `file`, the result of a commit on `source`, is
-// `overflow` bytes over MAX_QUEUE_BYTES. Completed jobs go first, oldest
-// first: they only remember work that is done, and a queue full of them must
-// still accept and lease new work. Then new pushes, in arrival order: each new
-// job is kept while it still fits, so one oversized push does not refuse the
-// smaller ones after it. Undefined means nothing is left to give up.
 export function planShedding(
   source: QueueFile,
   file: QueueFile,
@@ -584,10 +550,6 @@ export function emptyQueue(queue: QueueName, now: Instant): QueueFile {
   };
 }
 
-// A broker older than the `completed` list keeps it when it rewrites a queue,
-// but can enqueue a job that reuses a completed job's idempotency key. The
-// queued job wins, so such a file still loads and its next commit drops the
-// stale completion.
 function supersede(
   jobs: readonly QueueJob[],
   completed: readonly CompletedJob[] = [],
@@ -616,8 +578,6 @@ export function publicQueueFile(file: QueueFile): PublicQueueFile {
   return { ...shown, completed: completed.map(({ leaseToken: _leaseToken, ...job }) => job) };
 }
 
-// A complete for a job that is no longer queued. It succeeds again only for
-// the token that completed it, while that completion is kept.
 function completedBefore(
   draft: QueueDraft,
   mutation: MutationOf<"complete">,

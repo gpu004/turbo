@@ -1,9 +1,5 @@
 import { Config, ConfigProvider, Context, Layer, Schema, SchemaTransformation } from "effect";
 
-// Env vars are parsed once into typed settings. Code outside this module reads
-// the `Settings` service, never `env.*` strings. An out-of-range value falls
-// back to its default, matching the documented behaviour of each variable.
-
 function boundedInteger(name: SettingsVar, fallback: number, minimum: number, maximum: number) {
   const base10 = Schema.String.pipe(
     Schema.decodeTo(
@@ -38,9 +34,6 @@ const settingsConfig = Config.all({
   commitIntervalMs: boundedInteger("QUEUE_COMMIT_INTERVAL_MS", 1_000, 0, 60_000),
   maxPendingMutations: boundedInteger("MAX_PENDING_MUTATIONS", 10_000, 1, 1_000_000),
 }).pipe(
-  // A heartbeat or completion sent right after a claim waits up to one commit
-  // interval for its write. A lease of at least two intervals outlives that
-  // wait, with an interval to spare for the worker.
   Config.map((settings) => ({
     ...settings,
     leaseSeconds: Math.max(
@@ -62,7 +55,6 @@ export class Settings extends Context.Service<
     readonly maxPendingMutations: number;
   }
 >()("turbo/Settings") {
-  // Every variable has a fallback, so parsing cannot fail.
   static fromEnv(env: SettingsEnv): Layer.Layer<Settings> {
     return Layer.effect(Settings, settingsConfig.parse(ConfigProvider.fromUnknown(env))).pipe(
       Layer.orDie,

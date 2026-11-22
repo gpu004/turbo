@@ -1,13 +1,8 @@
+import { isAbsolute, relative } from "node:path";
 import { defineRule, eslintCompatPlugin } from "@oxlint/plugins";
 
 import type { ESTree, SourceCode } from "@oxlint/plugins";
 
-// Project rules for turbo. Each rule bans an operation everywhere, and
-// `.oxlintrc.json` turns it off for the single module that owns it. That way
-// the owning module is the one place an agent can add that kind of code.
-
-// Runtime globals such as Workers' `crypto` are not in Oxlint's builtin env, so
-// an identifier with no local binding also counts as the global.
 function isGlobal(sourceCode: SourceCode, node: ESTree.Node, name: string): boolean {
   if (node.type !== "Identifier" || node.name !== name) return false;
   if (sourceCode.isGlobalReference(node)) return true;
@@ -38,7 +33,6 @@ const AMBIENT_MEMBERS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
   ["Math", new Set(["random"])],
 ]);
 
-/** Keep the clock and randomness in src/domain.ts so the model stays deterministic. */
 const noAmbientEffectsRule = defineRule({
   meta: {
     type: "problem",
@@ -76,7 +70,109 @@ const noAmbientEffectsRule = defineRule({
   },
 });
 
-/** Untrusted JSON text is decoded by a schema, never parsed and trusted. */
+const ALLOWED_DIRECTIVE =
+  /^\s*(?:@ts-expect-error(?:\s|$)|SAFETY\s*:\s*\S|expect:\s*turbo\/[a-z-]+(?:\s|$))/u;
+
+function isAllowedDirective(comment: ESTree.Comment): boolean {
+  return comment.type === "Shebang" || ALLOWED_DIRECTIVE.test(comment.value);
+}
+
+function configuredMaxComments(option: unknown): ReadonlyMap<string, number> {
+  if (typeof option !== "object" || option === null || !("maxCommentsByFile" in option)) {
+    return new Map();
+  }
+
+  const raw = option.maxCommentsByFile;
+
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return new Map();
+
+  const limits = new Map<string, number>();
+
+  for (const [file, limit] of Object.entries(raw)) {
+    if (typeof limit === "number" && Number.isInteger(limit) && limit >= 0) {
+      limits.set(file.replaceAll("\\", "/").replace(/^\.\//u, ""), limit);
+    }
+  }
+
+  return limits;
+}
+
+function normalizeFilePath(cwd: string, filename: string): string {
+  const path = isAbsolute(filename) ? relative(cwd, filename) : filename;
+
+  return path.replaceAll("\\", "/").replace(/^\.\//u, "");
+}
+
+const noCommentsRule = defineRule({
+  meta: {
+    type: "problem",
+    docs: {
+      description:
+        "Disallow prose comments, with an optional per-file ratchet budget for incremental cleanup.",
+    },
+    messages: {
+      banned:
+        "Comments are disallowed. Delete tautologies/stale comments, file an issue for excuses, or move decision records to docs/adr/. Run /delete-comment to process them.",
+      exceedsBudget:
+        "Comment exceeds this file's ratchet budget of {{budget}} ({{actual}} found). Delete comments instead of adding new ones, or run /delete-comment.",
+      tightenRatchet:
+        "This file now has {{actual}} comment(s), below its ratchet budget of {{budget}}. Lower maxCommentsByFile['{{file}}'] to {{actual}} (or remove the entry when 0).",
+    },
+    schema: [
+      {
+        type: "object",
+        properties: {
+          maxCommentsByFile: {
+            type: "object",
+            additionalProperties: { type: "integer", minimum: 0 },
+          },
+        },
+        additionalProperties: false,
+      },
+    ],
+  },
+  createOnce(context) {
+    return {
+      Program(node) {
+        const comments = context.sourceCode
+          .getAllComments()
+          .filter((comment) => !isAllowedDirective(comment));
+        const maxByFile = configuredMaxComments(context.options?.[0]);
+        const filePath = normalizeFilePath(context.cwd, context.filename);
+        const budget = maxByFile.get(filePath);
+
+        if (budget === undefined || budget <= 0) {
+          for (const comment of comments) {
+            context.report({ loc: comment.loc, messageId: "banned" });
+          }
+
+          return;
+        }
+
+        if (comments.length > budget) {
+          for (const comment of comments.slice(budget)) {
+            context.report({
+              loc: comment.loc,
+              messageId: "exceedsBudget",
+              data: { budget, actual: comments.length },
+            });
+          }
+
+          return;
+        }
+
+        if (comments.length < budget) {
+          context.report({
+            node,
+            messageId: "tightenRatchet",
+            data: { file: filePath, actual: comments.length, budget },
+          });
+        }
+      },
+    };
+  },
+});
+
 const noJsonParseRule = defineRule({
   meta: {
     type: "problem",
@@ -116,7 +212,6 @@ function configuredBindings(option: unknown): ReadonlySet<string> {
   return new Set(option.bindings.flatMap((value) => (typeof value === "string" ? [value] : [])));
 }
 
-/** Env vars are strings; read them through the `Settings` service instead. */
 const noRawEnvVarsRule = defineRule({
   meta: {
     type: "problem",
@@ -151,11 +246,9 @@ const noRawEnvVarsRule = defineRule({
   },
 });
 
-// The only files `.oxlintrc.json` may turn each rule off for. `test.ts` fails
-// if the config disables a rule anywhere else, so silencing a rule for a new
-// file means changing this list, which a reviewer will see.
 export const RULE_OWNERS: Readonly<Record<string, readonly string[]>> = {
   "no-ambient-effects": ["src/domain.ts"],
+  "no-comments": [],
   "no-json-parse": ["src/rpc.ts"],
   "no-raw-env-vars": ["src/config.ts"],
 };
@@ -164,6 +257,7 @@ const turboPlugin = eslintCompatPlugin({
   meta: { name: "turbo" },
   rules: {
     "no-ambient-effects": noAmbientEffectsRule,
+    "no-comments": noCommentsRule,
     "no-json-parse": noJsonParseRule,
     "no-raw-env-vars": noRawEnvVarsRule,
   },

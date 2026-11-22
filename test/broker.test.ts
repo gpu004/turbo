@@ -25,10 +25,6 @@ import {
 } from "../src/domain";
 import { emptyQueue, parseQueueFile, type QueueFile } from "../src/model";
 
-// The commit protocol in src/broker.ts against an in-memory R2 object with the
-// same compare-and-set rule. spec/QueueBroker.tla model-checks the protocol;
-// these tests check that the Effect implementation follows it.
-
 const Q = QueueName.make("broker");
 
 const NOW = Instant.make("2026-08-31T12:00:00.000Z");
@@ -40,12 +36,8 @@ interface MemoryStore {
   readonly file: () => QueueFile | undefined;
 }
 
-// How the store fails the nth put (counting from 1): before writing, or after
-// writing, as when R2 applies a write but the response is lost.
 type PutFailure = (put: number) => { readonly landed: boolean; readonly code: number } | undefined;
 
-// `beforePut` runs before each write is checked, so a test can play a second
-// writer that changes the object underneath the broker.
 function memoryStore(
   beforePut: (write: (file: QueueFile) => void) => void = () => {},
   failPut: PutFailure = () => undefined,
@@ -101,8 +93,6 @@ function memoryStore(
   };
 }
 
-// Commit ids have their own counter, so job and lease numbers stay the same
-// however many commit attempts a test makes.
 function sequentialIds(): Layer.Layer<Ids> {
   let issued = 0;
   let commits = 0;
